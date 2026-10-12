@@ -656,6 +656,7 @@ class Simulator:
         n_samples: int = 100,
         seed: Optional[int] = None,
         input_domain: str = InputDomain.FIELD.value,
+        batch_parallel: bool = True,
     ) -> Dict[str, Any]:
         """Run *n_samples* Monte Carlo iterations and return aggregate statistics.
 
@@ -668,10 +669,13 @@ class Simulator:
         n_samples :
             Number of Monte Carlo iterations.
         seed :
-            Optional seed for reproducibility.  Each sample advances the
+            Optional seed for reproducibility. Each sample advances the
             generator state so results are deterministic for a given seed.
         input_domain :
             Same as :meth:`run`.
+        batch_parallel :
+            If True, attempt to evaluate all *n_samples* simultaneously using
+            PyTorch tensor broadcasting/batch dimension for acceleration.
 
         Returns
         -------
@@ -682,20 +686,35 @@ class Simulator:
         if seed is not None:
             rng.manual_seed(seed)
 
-        samples: List[torch.Tensor] = []
-        for _ in range(n_samples):
-            # Fork a child generator so each run sees independent noise
-            child = torch.Generator()
-            child.manual_seed(int(torch.randint(0, 2**31, (1,), generator=rng).item()))
-            sample = self.run(
-                input_feature,
-                optical_model,
-                generator=child,
-                input_domain=input_domain,
-            )
-            samples.append(sample)
+        stacked: Optional[torch.Tensor] = None
+        if batch_parallel:
+            try:
+                batched_input = input_feature.unsqueeze(0).expand(n_samples, *input_feature.shape)
+                stacked = self.run(
+                    batched_input,
+                    optical_model,
+                    generator=rng,
+                    input_domain=input_domain,
+                )
+            except Exception:
+                # Fallback to serial execution if model doesn't support leading batch dimension
+                stacked = None
 
-        stacked = torch.stack(samples)
+        if not batch_parallel or stacked is None:
+            samples: List[torch.Tensor] = []
+            for _ in range(n_samples):
+                # Fork a child generator so each run sees independent noise
+                child = torch.Generator()
+                child.manual_seed(int(torch.randint(0, 2**31, (1,), generator=rng).item()))
+                sample = self.run(
+                    input_feature,
+                    optical_model,
+                    generator=child,
+                    input_domain=input_domain,
+                )
+                samples.append(sample)
+            stacked = torch.stack(samples)
+
         flat = stacked.view(stacked.shape[0], -1)
 
         return {

@@ -221,20 +221,17 @@ class MZI(OpticalComponent):
             phi = self.phi
             theta = self.theta
 
-        transfer_matrix = torch.zeros(2, 2, dtype=torch.complex64, device=self._1j.device)
+        exp_jphi = torch.exp(self._1j * phi)
+        exp_jtheta = torch.exp(self._1j * theta)
 
-        transfer_matrix[0, 0] = torch.exp(self._1j * phi) * (
-            torch.exp(self._1j * theta) - 1
-        )
-        transfer_matrix[0, 1] = (
-            self._1j * torch.exp(self._1j * phi) * (1 + torch.exp(self._1j * theta))
-        )
-        transfer_matrix[1, 0] = self._1j * (torch.exp(self._1j * theta) + 1)
-        transfer_matrix[1, 1] = 1 - torch.exp(self._1j * theta)
+        t00 = 0.5 * exp_jphi * (exp_jtheta - 1.0)
+        t01 = 0.5 * self._1j * exp_jphi * (1.0 + exp_jtheta)
+        t10 = 0.5 * self._1j * (exp_jtheta + 1.0)
+        t11 = 0.5 * (1.0 - exp_jtheta)
 
-        transfer_matrix = 0.5 * transfer_matrix
-
-        return transfer_matrix
+        row0 = torch.stack([t00.squeeze(), t01.squeeze()])
+        row1 = torch.stack([t10.squeeze(), t11.squeeze()])
+        return torch.stack([row0, row1])
 
 
 class WaveGuide(OpticalComponent):

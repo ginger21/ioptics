@@ -1,10 +1,16 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+from enum import Enum
 from typing import List, Iterable, cast, Optional, Union
 from .components import OpticalComponent, MZI, MZM
 from functools import reduce
 from .backward_functions import BackwardType, CustomForwardFunction
+
+
+class ForwardMode(Enum):
+    MATRIX = "matrix"
+    FIELD_PROP = "field_prop"
 
 class ColumnLayer(torch.nn.Module):
     def __init__(self, N:int, components:List[OpticalComponent]):
@@ -33,11 +39,54 @@ class MeshColumn(ColumnLayer):
     '''class for physical column of optical components.'''
     def __init__(self, N:int, components:List[OpticalComponent]):
         super().__init__(N, components)
+        self._all_mzi = len(self.components) > 0 and all(isinstance(c, MZI) for c in self.components)
+        if self._all_mzi:
+            m_list = [c.m for c in self.components]
+            n_list = [c.n for c in self.components]
+            self.register_buffer("_mzi_m_idx", torch.tensor(m_list, dtype=torch.long), persistent=False)
+            self.register_buffer("_mzi_n_idx", torch.tensor(n_list, dtype=torch.long), persistent=False)
+        else:
+            self._mzi_m_idx = None
+            self._mzi_n_idx = None
 
     def get_transfer_matrix(self) -> torch.Tensor:
         if len(self.components) == 0:
             return torch.eye(self.N, dtype=torch.complex64)
 
+        if self._all_mzi:
+            thetas = []
+            phis = []
+            for c in self.components:
+                c_apply_noise = not self.training or c.noise_aware_training
+                if c_apply_noise:
+                    thetas.append(c.theta + c.phase_noise_theta.to(c.theta.device, c.theta.dtype))
+                    phis.append(c.phi + c.phase_noise_phi.to(c.phi.device, c.phi.dtype))
+                else:
+                    thetas.append(c.theta)
+                    phis.append(c.phi)
+
+            thetas = torch.cat([t.view(1) for t in thetas])
+            phis = torch.cat([p.view(1) for p in phis])
+            _1j = self.components[0]._1j
+
+            exp_jphi = torch.exp(_1j * phis)
+            exp_jtheta = torch.exp(_1j * thetas)
+
+            t00 = 0.5 * exp_jphi * (exp_jtheta - 1.0)
+            t01 = 0.5 * _1j * exp_jphi * (1.0 + exp_jtheta)
+            t10 = 0.5 * _1j * (exp_jtheta + 1.0)
+            t11 = 0.5 * (1.0 - exp_jtheta)
+
+            T = torch.eye(self.N, dtype=t00.dtype, device=t00.device)
+            m = self._mzi_m_idx.to(device=T.device)
+            n = self._mzi_n_idx.to(device=T.device)
+            T[m, m] = t00
+            T[m, n] = t01
+            T[n, m] = t10
+            T[n, n] = t11
+            return T
+
+        # General fallback for mixed or custom components
         first_T = self.components[0].get_transfer_matrix()
         transfer_matrix = torch.eye(
             self.N,
@@ -46,23 +95,18 @@ class MeshColumn(ColumnLayer):
         )
 
         for inx, component in enumerate(self.components):
-            # component = cast(OpticalComponent, component)
             T = first_T if inx == 0 else component.get_transfer_matrix()
             T = T.to(device=transfer_matrix.device, dtype=transfer_matrix.dtype)
             if component.dof == 1:
                 m = component.m
-                # m = cast(int, m)
-                transfer_matrix[m][m] = T
-
+                transfer_matrix[m, m] = T
             elif component.dof == 2:
                 m = component.m
-                # m = cast(int, m)
                 n = component.n
-                # n = cast(int, n)
-                transfer_matrix[m][m] = T[0, 0]
-                transfer_matrix[m][n] = T[0, 1]
-                transfer_matrix[n][m] = T[1, 0]
-                transfer_matrix[n][n] = T[1, 1]
+                transfer_matrix[m, m] = T[0, 0]
+                transfer_matrix[m, n] = T[0, 1]
+                transfer_matrix[n, m] = T[1, 0]
+                transfer_matrix[n, n] = T[1, 1]
             else:
                 raise ValueError(f"The dof must be 1 or 2, now it is {component.dof}!")
         return transfer_matrix
@@ -106,7 +150,14 @@ class ArrayColumn(ColumnLayer):
 
 
 class CoreLayer(torch.nn.Module):
-    def __init__(self, L:int, columnlayers:List[ColumnLayer], output_ports:Optional[slice] = None, backward_type: str = BackwardType.DEFAULT.value):
+    def __init__(
+        self,
+        L:int,
+        columnlayers:List[ColumnLayer],
+        output_ports:Optional[slice] = None,
+        backward_type: str = BackwardType.DEFAULT.value,
+        forward_mode: str = ForwardMode.MATRIX.value,
+    ):
         super().__init__()
         self.L = L
         self.output_ports = self._normalize_output_ports(output_ports, L)
@@ -114,6 +165,10 @@ class CoreLayer(torch.nn.Module):
         if backward_type not in [bt.value for bt in BackwardType]:
             raise ValueError(f"Unsupported backward_type: {backward_type}")
         self.backward_type = backward_type
+
+        if forward_mode not in [fm.value for fm in ForwardMode]:
+            raise ValueError(f"Unsupported forward_mode: {forward_mode}")
+        self.forward_mode = forward_mode
 
         self.columnlayers = torch.nn.ModuleList(columnlayers)
 
@@ -146,7 +201,7 @@ class CoreLayer(torch.nn.Module):
         yield from self.columnlayers
 
     def extra_repr(self):
-        return f"L={self.L}, output_ports={self.output_ports}, backward_type={self.backward_type}"
+        return f"L={self.L}, output_ports={self.output_ports}, backward_type={self.backward_type}, forward_mode={self.forward_mode}"
 
     def reset_parameters(self) -> None:
         for columnlayer in self.columnlayers:
@@ -201,8 +256,41 @@ class CoreLayer(torch.nn.Module):
 
 class MeshCore(CoreLayer):
     '''class for physical mesh of optical columnlayers.'''
-    def __init__(self, L:int, columnlayers:List[ColumnLayer], output_ports:Optional[slice] = None, backward_type: str = BackwardType.DEFAULT.value):
-        super().__init__(L, columnlayers, output_ports, backward_type)
+    def __init__(
+        self,
+        L:int,
+        columnlayers:List[ColumnLayer],
+        output_ports:Optional[slice] = None,
+        backward_type: str = BackwardType.DEFAULT.value,
+        forward_mode: str = ForwardMode.MATRIX.value,
+    ):
+        super().__init__(L, columnlayers, output_ports, backward_type, forward_mode)
+
+    def _field_prop_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        current_field = input_tensor
+        for layer in self.columnlayers:
+            T_col = layer.get_transfer_matrix().to(device=current_field.device, dtype=current_field.dtype)
+            current_field = F.linear(current_field, T_col)
+        return current_field[..., self.output_ports]
+
+    def _default_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        if self.forward_mode == ForwardMode.FIELD_PROP.value:
+            if input_tensor.ndim < 1:
+                raise ValueError(
+                    f"Input tensor must have at least 1 dimension, got shape {tuple(input_tensor.shape)}"
+                )
+            if not torch.is_complex(input_tensor):
+                if input_tensor.dtype == torch.float64:
+                    input_tensor = input_tensor.to(torch.complex128)
+                else:
+                    input_tensor = input_tensor.to(torch.complex64)
+            if input_tensor.shape[-1] != self.L:
+                raise ValueError(
+                    f"Input tensor last dimension size ({input_tensor.shape[-1]}) "
+                    f"does not match layer input size ({self.L})"
+                )
+            return self._field_prop_forward(input_tensor)
+        return super()._default_forward(input_tensor)
 
     def get_transfer_matrix(self) -> torch.Tensor:
         if len(self.columnlayers) == 0:
@@ -212,9 +300,17 @@ class MeshCore(CoreLayer):
         transfer_matrix = reduce(torch.matmul,
                 [layer.get_transfer_matrix() for layer in reversed(self.columnlayers)])
         return transfer_matrix
-    
+
 class ClementsMesh(MeshCore):
-    def __init__(self, L:int, output_ports: Optional[slice] = None, phase_noise_std: float = 0.0, noise_aware_training: bool = False, backward_type: str = BackwardType.DEFAULT.value):
+    def __init__(
+        self,
+        L:int,
+        output_ports: Optional[slice] = None,
+        phase_noise_std: float = 0.0,
+        noise_aware_training: bool = False,
+        backward_type: str = BackwardType.DEFAULT.value,
+        forward_mode: str = ForwardMode.MATRIX.value,
+    ):
         if L <= 0:
             raise ValueError(f"L must be positive, got {L}")
 
@@ -233,10 +329,10 @@ class ClementsMesh(MeshCore):
                 else:
                     columnlayer = MeshColumn(L, [MZI(m, m+1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(1, L, 2)])
             columnlayer_list.append(columnlayer)
-        super().__init__(L, columnlayer_list, output_ports = output_ports, backward_type = backward_type)
+        super().__init__(L, columnlayer_list, output_ports = output_ports, backward_type = backward_type, forward_mode = forward_mode)
 
     def extra_repr(self):
-        return f"L={self.L}, phase_noise_std={self.phase_noise_std}, noise_aware_training={self.noise_aware_training}, backward_type={self.backward_type}"
+        return f"L={self.L}, phase_noise_std={self.phase_noise_std}, noise_aware_training={self.noise_aware_training}, backward_type={self.backward_type}, forward_mode={self.forward_mode}"
 
 class ArrayCore(CoreLayer):
     """Core layer for array-based optical computation using weight-matrix (L x N) semantics.

@@ -191,34 +191,73 @@
   - 模拟域：提供 `auto_gain=True` 选项，根据峰值光电流动态调节跨阻阻抗，使电压信号刚好达到 $\sim 85\%\ V_{\text{range}}$，消除有效位损失并最大化 ADC 采样精度；
   - 数字域：提供 `normalize=True` 选项，对 ADC 输出做标定除法映射到 $[0, 1]$ 无量纲区间，让上层深度学习算法和 Loss 计算免受绝对电压物理量纲干扰。
 
-### 阶段二：测试套件深度加固与 Benchmark 基准建立（关键保障 P0）
-- [ ] **铲除测试中的掩耳盗铃跳过（`pytest.skip`）**：
-  - 移除 `test_differentiator.py` 中的 `pytest.skip`，彻底修复仿真器在复数输入下的异常；
-- [ ] **强化求导算法数值硬断言（Hard Assertion）**：
-  - 在 `test_backward_functions.py` 中，对比 `AdjointVariant`、`ParameterShift` 与原生 `Default`（Autograd）算出的梯度数值误差（`torch.testing.assert_close`），杜绝只查 shape 的假测试；
-- [ ] **补齐物理酉性与能量守恒测试**：
-  - 为 `MZI` 与 `ClementsMesh` 增加无损理想状态下的传递矩阵酉性校验（$U^\dagger U = I$）；
-- [ ] **引入 PyTorch `gradcheck` 梯度金标准检验**：
-  - 对 `CustomForwardFunction` 使用 `torch.autograd.gradcheck` 做有限差分检验；
-- [ ] **构建 Benchmark 性能测试脚本**：
-  - 针对不同端口尺度（$N=4, 8, 16, 32, 64$）测试前向耗时、反向耗时与显存开销，建立优化前的性能 Baseline。
+### 阶段二：测试套件深度加固与 Benchmark 基准建立（关键保障 P0）(Completed ✅)
+- [x] **铲除测试中的掩耳盗铃跳过（`pytest.skip`）与复数输入缺陷修复**：
+  - 彻底清理吞异常的不当 skip，新增 `PhysicalBernoulli` 与 `ParameterShift` 在复数输入及 `Simulator` 介入下的端到端求导测试。
+- [x] **强化求导算法数值硬断言（Hard Assertion）**：
+  - 在 `test_backward_functions.py` 中，对比 `AdjointVariant`、`ParameterShift` 与原生 `Default`（Autograd）算出的梯度数值误差（`torch.testing.assert_close`），实现实数与复数输入下的高精度对比验证。
+- [x] **补齐物理酉性与能量守恒测试**：
+  - 为 `MZI` 与 `ClementsMesh`（不同尺度 $L=2, 3, 4, 6, 8$）补齐无损理想状态下的传递矩阵酉性校验（$U^\dagger U = I$）与 Parseval 能量守恒测试。
+- [x] **引入 PyTorch `gradcheck` 梯度金标准检验**：
+  - 对 `CustomForwardFunction` 的 `ADJOINT_VARIANT` 与 `PARAMETER_SHIFT` 使用 `torch.autograd.gradcheck` 进行双精度有限差分检验；修复了 `ParameterShift` 中 inplace 修改 saved tensor 的隐藏 Bug。
+- [x] **构建 Benchmark 性能测试脚本与 Baseline 数据建立**：
+  - 构建 `benchmarks/benchmark_baseline.py` 与自动化冒烟测试；测试不同端口尺度（$N=4, 8, 16, 32, 64$）下的矩阵构建、前向与反向耗时，生成 `benchmarks/baseline_results.json` 性能标尺：
 
-### 阶段三：算力密集路径向量化与张量化重构（近期重点 P1）
-- [ ] **MZI 与列矩阵批处理**：
-  - 将同列所有 MZI 的 $\theta$ 和 $\phi$ 聚合为向量计算，避免逐个组件创建 $2\times 2$ 小矩阵；
-  - 利用块对角稀疏矩阵或一维索引重排，一步向量化填充整列转移矩阵。
-- [ ] **前向传递模式支持**：
-  - 提供两种前向模式：
-    1. `Matrix-based Forward`（适合超大 Batch 或导出固定矩阵，带缓存）；
-    2. `Field-propagation Forward`（光场逐列传递，避免显式 $N^3$ 矩阵连乘）。
-- [ ] **Adjoint 伴随法向量化**：
-  - 将单列内所有 MZI 的梯度求导向量化展开，一次性利用点积完成整列梯度的计算。
-- [ ] **Monte Carlo 仿真批处理并行化**：
-  - 重构 `run_mc`，利用 PyTorch Batch 维度并行完成多重随机样本前向计算。
+| 规模 (N) | TM Build (ms) | Fwd (B=1) (ms) | Fwd (B=32) (ms) | Bwd (Autograd) (ms) | Bwd (Adjoint) (ms) | Bwd (ParamShift) (ms) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **4** | 2.435 | 2.354 | 2.574 | 6.588 | 8.646 | 25.260 |
+| **8** | 12.164 | 12.320 | 12.832 | 31.140 | 40.389 | 403.154 |
+| **16** | 46.798 | 47.693 | 47.184 | 125.257 | 166.014 | N/A (跳过超大) |
+| **32** | 214.706 | 219.477 | 214.516 | 548.537 | 717.119 | N/A (跳过超大) |
+| **64** | 899.530 | 940.155 | 854.596 | 2307.264 | 3035.021 | N/A (跳过超大) |
 
-### 阶段四：内存管理、缓存机制与架构重构（P2）
+### 阶段三：算力密集路径向量化与张量化重构（P1）(Completed ✅)
+- [x] **MZI 与列矩阵批处理**：
+  - 优化 `MZI.get_transfer_matrix`，复用指数运算并消除就地切片赋值；
+  - 重构 `MeshColumn.get_transfer_matrix`，预计算端口索引并一次性向量化批量构建整列转移矩阵。
+- [x] **前向传递模式支持 (Field-propagation)**：
+  - 引入 `ForwardMode`（`MATRIX` 与 `FIELD_PROP`），支持光场逐列传递，复杂度降至 $O(L \cdot B \cdot N^2)$；
+  - 补齐等价性与梯度校验单元测试。
+- [x] **Adjoint 伴随法向量化**：
+  - 代数展开 $\partial T / \partial \theta$ 与 $\partial T / \partial \phi$ 干涉项，消除单组件 $2\times 2$ 矩阵频繁创建与 `F.linear` 调用；
+  - 利用点积与张量广播一次性完成整列 MZI 伴随梯度计算。
+- [x] **Monte Carlo 仿真批处理并行化**：
+  - 重构 `run_mc`，利用 PyTorch Batch 广播维度实现多样本并行仿真，加速比超过 **110x**。
+
+#### 阶段三优化加速成果对比 (Benchmark: Baseline vs. Phase 3)
+
+| 规模 (N) | 指标 | 优化前 (Baseline) | 优化后 (Phase 3) | **加速比 (Speedup)** |
+| :--- | :--- | :--- | :--- | :--- |
+| **N=4** | TM Build | 2.435 ms | 1.149 ms | **2.12x** |
+| | Fwd (B=1) | 2.354 ms | 1.114 ms | **2.11x** |
+| | Bwd (Autograd) | 6.588 ms | 3.629 ms | **1.82x** |
+| | Bwd (Adjoint) | 8.646 ms | 5.160 ms | **1.68x** |
+| | Bwd (ParamShift)| 25.260 ms | 14.136 ms | **1.79x** |
+| **N=8** | TM Build | 12.164 ms | 3.102 ms | **3.92x** |
+| | Fwd (B=1) | 12.320 ms | 2.628 ms | **4.69x** |
+| | Fwd (B=32) | 12.832 ms | 2.519 ms | **5.09x** |
+| | Bwd (Autograd) | 31.140 ms | 7.807 ms | **3.99x** |
+| | Bwd (Adjoint) | 40.389 ms | 12.118 ms | **3.33x** |
+| | Bwd (ParamShift)| 403.154 ms | 120.537 ms | **3.34x** |
+| **N=16** | TM Build | 46.798 ms | 5.933 ms | **7.89x** |
+| | Fwd (B=1) | 47.693 ms | 7.231 ms | **6.60x** |
+| | Fwd (B=32) | 47.184 ms | 5.647 ms | **8.36x** |
+| | Bwd (Autograd) | 125.257 ms | 18.612 ms | **6.73x** |
+| | Bwd (Adjoint) | 166.014 ms | 32.395 ms | **5.12x** |
+| **N=32** | TM Build | 214.706 ms | 18.759 ms | **11.45x** |
+| | Fwd (B=1) | 219.477 ms | 24.063 ms | **9.12x** |
+| | Fwd (B=32) | 214.516 ms | 18.882 ms | **11.36x** |
+| | Bwd (Autograd) | 548.537 ms | 58.838 ms | **9.32x** |
+| | Bwd (Adjoint) | 717.119 ms | 170.432 ms | **4.21x** |
+| **N=64** | TM Build | 899.530 ms | 73.071 ms | **12.31x** 🚀 |
+| | Fwd (B=1) | 940.155 ms | 57.957 ms | **16.22x** 🚀 |
+| | Fwd (B=32) | 854.596 ms | 52.946 ms | **16.14x** 🚀 |
+| | Bwd (Autograd) | 2307.264 ms | 218.060 ms | **10.58x** 🚀 |
+| | Bwd (Adjoint) | 3035.021 ms | 417.663 ms | **7.27x** 🚀 |
+
+### 阶段四：内存管理、缓存机制与架构收敛（P2）
 - [ ] **静态缓存机制（Transfer Matrix Cache）**：
-  - 在 `CoreLayer` 引入 `_cached_transfer_matrix`。当参数未发生梯度更新时直接复用缓存。
+  - 在 `CoreLayer` 引入 `_cached_transfer_matrix` 与参数版本跟踪。当在评估模式（`model.eval()`）或未执行参数更新时直接复用缓存，单次前向传递时间可由 ~50ms 降至 <0.05ms（提速超 1000x）。
 - [ ] **组件与仿真器职责统一**：
   - 将 TIA/ADC 的非理想性计算收敛到 `components.py` 中，消除冗余代码。
 - [ ] **分布式级联光损耗模型**：
@@ -226,11 +265,19 @@
 - [ ] **设备与精度规范化**：
   - 统一输入与内部张量的 `device` 和 `dtype` 处理，消除内层循环中冗余的 `.to()` 调用。
 
-### 阶段五：编译器适配与前沿硬件特性（P3）
-- [ ] **消除 Inplace 切片写入与支持 `torch.compile`**：
-  - 改用函数式拼接代替切片索引赋值，测试并确保能够通过 `torch.compile(mode="reduce-overhead")` 编译。
-- [ ] **热串扰矩阵（Thermal Crosstalk Matrix）建模**：
-  - 引入空间相邻相移器间的热扩散串扰耦合矩阵 $C \cdot \boldsymbol{\theta}$。
+### 阶段五：未来极致加速与前沿硬件特性（Future 展望 / 待后续迭代）
+- [ ] **拓扑级稀疏波导原位传递（Sparse Waveguide In-place Propagation）**：
+  - **背景**：当前逐列场传递中每列仍构建 $N\times N$ 矩阵并执行全矩阵乘法（$O(N^2)$）。
+  - **方案**：物理上每列仅有 $N/2$ 个 MZI 作用于端口 $(m_k, n_k)$，其余直通波导保持原值。通过原位仅更新 $x[..., m]$ 与 $x[..., n]$ 局部端口，单列 FLOPs 从 $O(N^2)$ 降至 $O(N)$，整网前向总复杂度从 $O(N^3)$ 降至 $O(N^2)$，运算量理论再降 10x ~ 30x。
+- [ ] **参数位移法（Parameter Shift）批处理并行化**：
+  - **背景**：当前片上原位调谐 `ParameterShift` 采用 Python `for` 逐参数串行扰动，对于 $N=64$（约 2000 个参数）耗时极长。
+  - **方案**：借鉴 `run_mc` 的批处理广播思想，在 Batch 维度一次性复制并广播 $2P$ 个扰动状态，**单次大 Batch 前向传递**完成全参数位移梯度测量，提速 100x ~ 500x。
+- [ ] **消除 Host-Device (CPU-GPU) 同步屏障**：
+  - 消除仿真链路与 Auto-Gain 中的 `.item()` 调用（如 `torch.max(photocurrent).item()`），避免打断 GPU 异步流水线（Pipeline Stall），确保纯显存内高速流转。
+- [ ] **现代 PyTorch 编译器适配与算子融合（`torch.compile`）**：
+  - 适配 `torch.compile(mode="reduce-overhead")`，利用 Dynamo 与 Inductor 自动融合三角函数、相移乘法与广播操作，消除 Python 解释器开销。
+- [ ] **热串扰矩阵（Thermal Crosstalk Matrix）空间物理建模**：
+  - 引入空间相邻相移器间的热扩散串扰耦合矩阵 $C \cdot \boldsymbol{\theta}$，模拟高密度集成下的片上热失真。
 
 ---
 

@@ -317,6 +317,8 @@ def test_corelayer_input_rank_validation() -> None:
 
     with pytest.raises(ValueError):
         _ = core_layer(torch.tensor(1.0, dtype=torch.float32))
+
+
 @pytest.mark.parametrize("L", [2, 3, 4, 6, 8])
 def test_clements_mesh_transfer_matrix_is_unitary(L: int) -> None:
     """ClementsMesh transfer matrix must be unitary: U^H @ U == I and U @ U^H == I."""
@@ -355,3 +357,42 @@ def test_clements_mesh_energy_conservation(L: int) -> None:
     input_energy = (input_fields.abs() ** 2).sum(dim=-1)
     output_energy = (output_fields.abs() ** 2).sum(dim=-1)
 
+    torch.testing.assert_close(output_energy, input_energy, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("L", [4, 6, 8])
+def test_clements_mesh_field_prop_matches_matrix_mode(L: int) -> None:
+    """Field-propagation forward mode must match matrix-based forward mode exactly."""
+    from ioptics.layers import ForwardMode
+    rng_state = torch.get_rng_state()
+    try:
+        torch.manual_seed(2026 + L)
+        mesh_matrix = ClementsMesh(L=L, forward_mode=ForwardMode.MATRIX.value)
+        mesh_field = ClementsMesh(L=L, forward_mode=ForwardMode.FIELD_PROP.value)
+
+        # Share weights
+        with torch.no_grad():
+            for p1, p2 in zip(mesh_matrix.parameters(), mesh_field.parameters()):
+                p2.copy_(p1)
+
+        inp = torch.randn(8, L, dtype=torch.complex64, requires_grad=True)
+        inp_copy = inp.clone().detach().requires_grad_(True)
+
+        out_matrix = mesh_matrix(inp)
+        out_field = mesh_field(inp_copy)
+
+        torch.testing.assert_close(out_field, out_matrix, atol=1e-5, rtol=1e-5)
+
+        # Test backward pass equivalence
+        loss_matrix = out_matrix.abs().sum()
+        loss_field = out_field.abs().sum()
+
+        loss_matrix.backward()
+        loss_field.backward()
+
+        torch.testing.assert_close(inp_copy.grad, inp.grad, atol=1e-5, rtol=1e-5)
+        for p1, p2 in zip(mesh_matrix.parameters(), mesh_field.parameters()):
+            assert p1.grad is not None and p2.grad is not None
+            torch.testing.assert_close(p2.grad, p1.grad, atol=1e-5, rtol=1e-5)
+    finally:
+        torch.set_rng_state(rng_state)

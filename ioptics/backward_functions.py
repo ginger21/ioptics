@@ -145,66 +145,113 @@ class AdjointStrategy(BackwardStrategy):
 
                 layer_grads = []
 
-                for component in column.components:
-                    if isinstance(component, MZI):
-                        m, n = component.m, component.n
-                        theta = (component.theta + component.phase_noise_theta).to(internal_dtype)
-                        phi = (component.phi + component.phase_noise_phi).to(internal_dtype)
+                is_pure_mzi = len(column.components) > 0 and all(isinstance(c, MZI) for c in column.components)
+                if is_pure_mzi:
+                    m_idx = getattr(column, "_mzi_m_idx", None)
+                    n_idx = getattr(column, "_mzi_n_idx", None)
+                    if m_idx is None or n_idx is None:
+                        m_idx = [c.m for c in column.components]
+                        n_idx = [c.n for c in column.components]
+                    else:
+                        m_idx = m_idx.to(device)
+                        n_idx = n_idx.to(device)
 
-                        a = torch.stack([A_fwd[..., m], A_fwd[..., n]], dim=-1)
-                        adj = torch.stack([adjoint_field[..., m], adjoint_field[..., n]], dim=-1)
+                    thetas = torch.cat([(c.theta + c.phase_noise_theta).view(1).to(internal_dtype) for c in column.components])
+                    phis = torch.cat([(c.phi + c.phase_noise_phi).view(1).to(internal_dtype) for c in column.components])
 
-                        e_itheta = torch.exp(_1j * theta)
-                        e_iphi = torch.exp(_1j * phi)
-                        e_i_pt = e_iphi * e_itheta
+                    a_m = A_fwd[..., m_idx]
+                    a_n = A_fwd[..., n_idx]
+                    adj_m = adjoint_field[..., m_idx]
+                    adj_n = adjoint_field[..., n_idx]
 
-                        # ∂T/∂θ
-                        dT_dtheta = torch.zeros(2, 2, dtype=internal_dtype, device=device)
-                        dT_dtheta[0, 0] = 0.5 * _1j * e_i_pt
-                        dT_dtheta[0, 1] = -0.5 * e_i_pt
-                        dT_dtheta[1, 0] = -0.5 * e_itheta
-                        dT_dtheta[1, 1] = -0.5 * _1j * e_itheta
+                    e_itheta = torch.exp(_1j * thetas)
+                    e_iphi = torch.exp(_1j * phis)
+                    e_i_pt = e_iphi * e_itheta
 
-                        # ∂T/∂φ
-                        T_comp = component.get_transfer_matrix().to(device, dtype=internal_dtype)
-                        dT_dphi = torch.zeros(2, 2, dtype=internal_dtype, device=device)
-                        dT_dphi[0, 0] = _1j * T_comp[0, 0]
-                        dT_dphi[0, 1] = _1j * T_comp[0, 1]
+                    out0_theta = 0.5 * e_i_pt * (_1j * a_m - a_n)
+                    out1_theta = -0.5 * e_itheta * (a_m + _1j * a_n)
+                    term_theta = adj_m.conj() * out0_theta + adj_n.conj() * out1_theta
 
-                        # grad = Re(adj^H · ∂T/∂param · a)
-                        grad_theta = _sum_all_dims(adj.conj() * F.linear(a, dT_dtheta)).real
-                        grad_phi = _sum_all_dims(adj.conj() * F.linear(a, dT_dphi)).real
+                    if term_theta.ndim > 1:
+                        grad_theta_vec = term_theta.sum(dim=tuple(range(term_theta.ndim - 1))).real
+                    else:
+                        grad_theta_vec = term_theta.real
 
-                        grad_theta_param = grad_theta.reshape_as(component.theta)
-                        grad_phi_param = grad_phi.reshape_as(component.phi)
-                        param_grad_map[id(component.theta)] = grad_theta_param
-                        param_grad_map[id(component.phi)] = grad_phi_param
-                        layer_grads.extend([grad_theta_param, grad_phi_param])
+                    out0_phi = 0.5 * _1j * e_iphi * ((e_itheta - 1.0) * a_m + _1j * (1.0 + e_itheta) * a_n)
+                    term_phi = adj_m.conj() * out0_phi
 
-                    elif isinstance(component, PhaseShifter):
-                        m = component.m
-                        phi = (component.phi + component.phase_noise_phi).to(internal_dtype)
+                    if term_phi.ndim > 1:
+                        grad_phi_vec = term_phi.sum(dim=tuple(range(term_phi.ndim - 1))).real
+                    else:
+                        grad_phi_vec = term_phi.real
 
-                        a_m = A_fwd[..., m]
-                        adj_m = adjoint_field[..., m]
+                    for k, component in enumerate(column.components):
+                        gt = grad_theta_vec[k].to(device=component.theta.device, dtype=component.theta.dtype).reshape_as(component.theta)
+                        gp = grad_phi_vec[k].to(device=component.phi.device, dtype=component.phi.dtype).reshape_as(component.phi)
+                        param_grad_map[id(component.theta)] = gt
+                        param_grad_map[id(component.phi)] = gp
+                        layer_grads.extend([gt, gp])
+                else:
+                    for component in column.components:
+                        if isinstance(component, MZI):
+                            m, n = component.m, component.n
+                            theta = (component.theta + component.phase_noise_theta).to(internal_dtype)
+                            phi = (component.phi + component.phase_noise_phi).to(internal_dtype)
 
-                        grad_phi = _sum_all_dims(adj_m.conj() * _1j * torch.exp(_1j * phi) * a_m).real
-                        grad_phi_param = grad_phi.reshape_as(component.phi)
-                        param_grad_map[id(component.phi)] = grad_phi_param
-                        layer_grads.append(grad_phi_param)
+                            a = torch.stack([A_fwd[..., m], A_fwd[..., n]], dim=-1)
+                            adj = torch.stack([adjoint_field[..., m], adjoint_field[..., n]], dim=-1)
 
-                    elif isinstance(component, MZM):
-                        m = component.m
-                        theta = (component.theta + component.phase_noise_theta).to(internal_dtype)
+                            e_itheta = torch.exp(_1j * theta)
+                            e_iphi = torch.exp(_1j * phi)
+                            e_i_pt = e_iphi * e_itheta
 
-                        a_m = A_fwd[..., m]
-                        adj_m = adjoint_field[..., m]
+                            # ∂T/∂θ
+                            dT_dtheta = torch.zeros(2, 2, dtype=internal_dtype, device=device)
+                            dT_dtheta[0, 0] = 0.5 * _1j * e_i_pt
+                            dT_dtheta[0, 1] = -0.5 * e_i_pt
+                            dT_dtheta[1, 0] = -0.5 * e_itheta
+                            dT_dtheta[1, 1] = -0.5 * _1j * e_itheta
 
-                        dT_dtheta = 0.5 * _1j * torch.exp(_1j * theta)
-                        grad_theta = _sum_all_dims(adj_m.conj() * dT_dtheta * a_m).real
-                        grad_theta_param = grad_theta.reshape_as(component.theta)
-                        param_grad_map[id(component.theta)] = grad_theta_param
-                        layer_grads.append(grad_theta_param)
+                            # ∂T/∂φ
+                            T_comp = component.get_transfer_matrix().to(device, dtype=internal_dtype)
+                            dT_dphi = torch.zeros(2, 2, dtype=internal_dtype, device=device)
+                            dT_dphi[0, 0] = _1j * T_comp[0, 0]
+                            dT_dphi[0, 1] = _1j * T_comp[0, 1]
+
+                            # grad = Re(adj^H · ∂T/∂param · a)
+                            grad_theta = _sum_all_dims(adj.conj() * F.linear(a, dT_dtheta)).real
+                            grad_phi = _sum_all_dims(adj.conj() * F.linear(a, dT_dphi)).real
+
+                            grad_theta_param = grad_theta.reshape_as(component.theta)
+                            grad_phi_param = grad_phi.reshape_as(component.phi)
+                            param_grad_map[id(component.theta)] = grad_theta_param
+                            param_grad_map[id(component.phi)] = grad_phi_param
+                            layer_grads.extend([grad_theta_param, grad_phi_param])
+
+                        elif isinstance(component, PhaseShifter):
+                            m = component.m
+                            phi = (component.phi + component.phase_noise_phi).to(internal_dtype)
+
+                            a_m = A_fwd[..., m]
+                            adj_m = adjoint_field[..., m]
+
+                            grad_phi = _sum_all_dims(adj_m.conj() * _1j * torch.exp(_1j * phi) * a_m).real
+                            grad_phi_param = grad_phi.reshape_as(component.phi)
+                            param_grad_map[id(component.phi)] = grad_phi_param
+                            layer_grads.append(grad_phi_param)
+
+                        elif isinstance(component, MZM):
+                            m = component.m
+                            theta = (component.theta + component.phase_noise_theta).to(internal_dtype)
+
+                            a_m = A_fwd[..., m]
+                            adj_m = adjoint_field[..., m]
+
+                            dT_dtheta = 0.5 * _1j * torch.exp(_1j * theta)
+                            grad_theta = _sum_all_dims(adj_m.conj() * dT_dtheta * a_m).real
+                            grad_theta_param = grad_theta.reshape_as(component.theta)
+                            param_grad_map[id(component.theta)] = grad_theta_param
+                            layer_grads.append(grad_theta_param)
 
                 all_grads = layer_grads + all_grads
 
