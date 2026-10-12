@@ -40,13 +40,13 @@ y = model(x)
 print("Model output shape:", y.shape)
 
 # Optional: run hardware-aware simulation
-sim = iop.simulator(profile=iop.SimulatorProfile.LAB.value)
+sim = iop.Simulator(profile=iop.HardwareProfile.LAB.value)
 y_sim = sim.run(
     x,
     model,
-    mode=iop.SimulationMode.STOCHASTIC.value,
+    mode=iop.ExecutionMode.STOCHASTIC.value,
     seed=42,
-    model_output_domain=iop.ModelOutputDomain.POWER.value,
+    output_domain=iop.OutputDomain.POWER.value,
 )
 print("Sim output shape:", y_sim.shape)
 ```

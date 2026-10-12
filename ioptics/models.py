@@ -191,6 +191,7 @@ class OpticalNN(torch.nn.Sequential):
             y_label: torch.Tensor,
             epochs: int,
             differentiator: Differentiator,
+            simulator: Optional[object] = None,
             optimizer: Optional[torch.optim.Optimizer] = None,
             lr: float = 0.01,
             batch_size: int = 32,
@@ -207,6 +208,7 @@ class OpticalNN(torch.nn.Sequential):
             y_label: Target tensor for training
             epochs: Number of training epochs
             differentiator: Differentiator object for computing gradients
+            simulator: Optional Simulator object for hardware-in-the-loop simulation
             optimizer: Optional PyTorch optimizer (uses internal update if None)
             lr: Learning rate for parameter updates
             batch_size: Size of training batches
@@ -217,16 +219,29 @@ class OpticalNN(torch.nn.Sequential):
         Returns:
             TrainingHistory: Immutable snapshot of loss and accuracy history during training
         """
+        active_sim = simulator
+        if active_sim is None and hasattr(differentiator, 'simulator') and differentiator.simulator is not None:
+            active_sim = differentiator.simulator
+
+        if active_sim is not None:
+            output_getter = lambda batch_X: active_sim.run(batch_X, self)
+            log_formatter = lambda epoch, avg_loss, avg_accuracy: (
+                f"Epoch {epoch}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.2f}%"
+            )
+        else:
+            output_getter = lambda batch_X: torch.abs(self(batch_X))
+            log_formatter = lambda epoch, avg_loss, avg_accuracy: (
+                f"Epoch {epoch}, Loss: {avg_loss}, Accuracy: {avg_accuracy}"
+            )
+
         self._fit_impl(
             loss_function=loss_function,
             X_input=X_input,
             y_label=y_label,
             epochs=epochs,
             differentiator=differentiator,
-            output_getter=lambda batch_X: torch.abs(self(batch_X)),
-            log_formatter=lambda epoch, avg_loss, avg_accuracy: (
-                f"Epoch {epoch}, Loss: {avg_loss}, Accuracy: {avg_accuracy}"
-            ),
+            output_getter=output_getter,
+            log_formatter=log_formatter,
             optimizer=optimizer,
             lr=lr,
             batch_size=batch_size,
@@ -236,7 +251,8 @@ class OpticalNN(torch.nn.Sequential):
         )
         return self._snapshot_history()
 
-    def fit_simulation(self,
+    def fit_simulation(
+        self,
         loss_function: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         X_input: torch.Tensor,
         y_label: torch.Tensor,
@@ -248,31 +264,17 @@ class OpticalNN(torch.nn.Sequential):
         verbose: bool = True,
         metric_fn: Optional[Callable[[torch.Tensor, torch.Tensor], float | torch.Tensor]] = None,
         reset_history: bool = False,
-        ) -> TrainingHistory:
-        """
-        Train with simulator-backed forward outputs.
-
-        reset_history controls whether previous history is cleared before training.
-        Returns a TrainingHistory immutable snapshot.
-
-        Raises:
-        - TypeError: differentiator does not provide a usable simulator.
-        """
-
+    ) -> TrainingHistory:
+        """Deprecated: use fit(..., simulator=...) instead."""
         if not hasattr(differentiator, 'simulator') or differentiator.simulator is None:
             raise TypeError("differentiator 必须有 simulator 属性，请使用 PhysicalBernoulliDifferentiator")
-        sim = differentiator.simulator
-
-        self._fit_impl(
+        return self.fit(
             loss_function=loss_function,
             X_input=X_input,
             y_label=y_label,
             epochs=epochs,
             differentiator=differentiator,
-            output_getter=lambda batch_X: sim.run(batch_X, self),
-            log_formatter=lambda epoch, avg_loss, avg_accuracy: (
-                f"Epoch {epoch}, Loss: {avg_loss:.4f}, Accuracy: {avg_accuracy:.2f}%"
-            ),
+            simulator=differentiator.simulator,
             optimizer=optimizer,
             lr=lr,
             batch_size=batch_size,
@@ -280,4 +282,3 @@ class OpticalNN(torch.nn.Sequential):
             metric_fn=metric_fn,
             reset_history=reset_history,
         )
-        return self._snapshot_history()

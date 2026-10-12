@@ -384,3 +384,28 @@ def test_fit_simulation_raises_when_differentiator_has_no_usable_simulator(diffe
             verbose=False,
             batch_size=4,
         )
+
+
+def test_fit_with_simulator_parameter():
+    from ioptics.simulator import Simulator
+    layer = ClementsMesh(L=4)
+    model = OpticalNN(layer)
+    loss_function = torch.nn.CrossEntropyLoss()
+    differentiator = _ZeroGradientDifferentiator()
+    sim = Simulator()
+
+    X = torch.randn(8, 4) + 1j * torch.randn(8, 4)
+    y = torch.randint(0, 4, (8,))
+
+    history = model.fit(
+        loss_function=loss_function,
+        X_input=X,
+        y_label=y,
+        epochs=2,
+        differentiator=differentiator,
+        simulator=sim,
+        verbose=False,
+        batch_size=4,
+    )
+    assert len(history.loss_history) == 2
+    assert len(history.accuracy_history) == 2

@@ -16,8 +16,8 @@ from .layers import MeshCore, ArrayCore
 # Enums / typed literals
 # ---------------------------------------------------------------------------
 
-class SimulatorProfile(str, Enum):
-    """Pre-defined simulator operating profiles."""
+class HardwareProfile(str, Enum):
+    """Pre-defined simulator operating hardware specifications/profiles."""
     IDEAL = "ideal"
     LAB = "lab"
     HARDWARE_LIKE = "hardware_like"
@@ -35,14 +35,14 @@ class LossModel(str, Enum):
     COMPONENT = "component"
 
 
-class SimulationMode(str, Enum):
-    """Operating mode for a simulation call."""
-    IDEAL = "ideal"
+class ExecutionMode(str, Enum):
+    """Operating execution mode for a simulation run."""
+    DETERMINISTIC = "deterministic"
     STOCHASTIC = "stochastic"
     MC = "mc"
 
 
-class ModelOutputDomain(str, Enum):
+class OutputDomain(str, Enum):
     """Interpretation of the optical model's output tensor."""
     AUTO = "auto"
     FIELD = "field"
@@ -63,14 +63,14 @@ class SimulatorConfig:
     boltzmann: float = 1.381e-23        # J/K
 
     # Optical loss parameters (layer-count model)
-    mzi_insertion_loss: float = 1.2     # dB per MZI layer
+    layer_loss_db: float = 1.2          # dB per MZI mesh layer/column
     coupling_loss: float = 0.5          # dB
 
     # Loss model strategy
     loss_model: str = LossModel.LAYER.value  # "layer" | "component"
 
     # Component-level loss coefficients (dB per component instance)
-    mzi_loss: float = 0.6               # dB per MZI
+    component_loss_db: float = 0.6      # dB per MZI instance
     mzm_loss: float = 0.4               # dB per MZM
     phase_shifter_loss: float = 0.15    # dB per PhaseShifter
 
@@ -108,29 +108,31 @@ class SimulatorConfig:
     adc_transition_noise_lsb: float = 0.0           # LSB units; DNL-like transition noise
     adc_inl_coefficient: float = 0.0                # cubic INL-like distortion coefficient
 
-    # Model output domain interpretation
-    model_output_domain: str = ModelOutputDomain.AUTO.value  # "auto" | "field" | "power"
+    # Domain interpretation
+    input_domain: str = InputDomain.FIELD.value
+    output_domain: str = OutputDomain.AUTO.value
 
     @staticmethod
-    def from_profile(profile: SimulatorProfile) -> SimulatorConfig:
+    def from_profile(profile: HardwareProfile | str) -> SimulatorConfig:
         """Return a pre-configured ``SimulatorConfig`` for the given profile."""
-        if profile == SimulatorProfile.IDEAL:
+        prof = HardwareProfile(profile)
+        if prof == HardwareProfile.IDEAL:
             return SimulatorConfig(
-                mzi_insertion_loss=0.0,
+                layer_loss_db=0.0,
                 coupling_loss=0.0,
                 laser_noise=False,
                 detector_noise=False,
             )
-        if profile == SimulatorProfile.LAB:
+        if prof == HardwareProfile.LAB:
             return SimulatorConfig(
-                mzi_insertion_loss=1.0,
+                layer_loss_db=1.0,
                 coupling_loss=0.3,
                 laser_noise=True,
                 detector_noise=True,
             )
-        if profile == SimulatorProfile.HARDWARE_LIKE:
+        if prof == HardwareProfile.HARDWARE_LIKE:
             return SimulatorConfig(
-                mzi_insertion_loss=1.5,
+                layer_loss_db=1.5,
                 coupling_loss=0.8,
                 laser_rin=-150.0,
                 laser_linewidth=5e5,
@@ -259,36 +261,31 @@ def _apply_adc_non_idealities(
 
 
 # ---------------------------------------------------------------------------
-# Simulator class (backward-compatible name ``simulator`` kept as alias)
+# Simulator class
 # ---------------------------------------------------------------------------
 
-class simulator:
-    """Optical-neural-network simulator with configurable profiles and tracing.
-
-    Backward compatibility: calling ``simulator()`` without arguments produces
-    the same behaviour as before (defaults equivalent to the ``ideal`` profile
-    but with the original hard-coded constants).
-    """
+class Simulator:
+    """Optical-neural-network simulator with configurable profiles and tracing."""
 
     def __init__(
         self,
         config: Optional[SimulatorConfig] = None,
         *,
-        profile: str = SimulatorProfile.IDEAL.value,
+        profile: str = HardwareProfile.IDEAL.value,
     ) -> None:
         # Resolve profile
-        self._profile = SimulatorProfile(profile)
+        self._profile = HardwareProfile(profile)
 
         if config is not None:
             self._config = config
         else:
             self._config = SimulatorConfig.from_profile(self._profile)
 
-        # Convenience aliases (maintain backward-compatible attribute access)
+        # Convenience aliases
         self.temperature: float = self._config.temperature
         self.electron_charge: float = self._config.electron_charge
         self.boltzmann: float = self._config.boltzmann
-        self.mzi_insertion_loss: float = self._config.mzi_insertion_loss
+        self.layer_loss_db: float = self._config.layer_loss_db
         self.coupling_loss: float = self._config.coupling_loss
         self.loss_model: str = self._config.loss_model
 
@@ -302,13 +299,13 @@ class simulator:
             return self._compute_component_loss(optical_model)
         # Default: layer-count model
         total_layers = _count_optical_layers(optical_model)
-        return total_layers * self._config.mzi_insertion_loss + self._config.coupling_loss
+        return total_layers * self._config.layer_loss_db + self._config.coupling_loss
 
     def _compute_component_loss(self, optical_model: torch.nn.Module) -> float:
         """Compute loss from individual component counts plus coupling loss."""
         counts = _count_optical_components(optical_model)
         loss = (
-            counts["mzi"] * self._config.mzi_loss
+            counts["mzi"] * self._config.component_loss_db
             + counts["mzm"] * self._config.mzm_loss
             + counts["phase_shifter"] * self._config.phase_shifter_loss
             + self._config.coupling_loss
@@ -324,13 +321,13 @@ class simulator:
         input_feature: torch.Tensor,
         optical_model: torch.nn.Module,
         *,
-        mode: str = SimulationMode.STOCHASTIC.value,
+        mode: str = ExecutionMode.STOCHASTIC.value,
         seed: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
         return_trace: bool = False,
         input_domain: str = InputDomain.FIELD.value,
         mc_samples: int = 100,
-        model_output_domain: Optional[str] = None,
+        output_domain: Optional[str] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace] | Dict[str, Any]:
         """Run a forward simulation.
 
@@ -341,25 +338,25 @@ class simulator:
         optical_model :
             A ``torch.nn.Module`` containing MeshCore / ArrayCore layers.
         mode :
-            Simulation mode. One of ``"ideal"``, ``"stochastic"`` (default),
-            or ``"mc"``.  In ``"mc"`` mode the result is a Monte Carlo
+            Execution mode. One of ``"deterministic"``, ``"stochastic"`` (default),
+            or ``"mc"``. In ``"mc"`` mode the result is a Monte Carlo
             aggregate dictionary (same structure as :meth:`run_mc`) with
             *mc_samples* iterations.
         seed :
-            Optional integer seed for reproducibility.  Mutually exclusive with
+            Optional integer seed for reproducibility. Mutually exclusive with
             *generator*.
         generator :
-            Optional ``torch.Generator``.  Mutually exclusive with *seed*.
+            Optional ``torch.Generator``. Mutually exclusive with *seed*.
         return_trace :
             If ``True``, also return a ``SimulationTrace`` with intermediate
-            pipeline values.  Not supported in ``"mc"`` mode.
+            pipeline values. Not supported in ``"mc"`` mode.
         input_domain :
             ``"field"`` (default) -- *input_feature* is optical field amplitude.
             ``"power"`` -- *input_feature* is optical power; converted to field.
         mc_samples :
-            Number of Monte Carlo samples when ``mode="mc"``.  Ignored for
+            Number of Monte Carlo samples when ``mode="mc"``. Ignored for
             other modes.
-        model_output_domain :
+        output_domain :
             Interpretation of the model's output. ``"auto"`` (default) infers domain
             from tensor properties or model attribute. ``"field"`` treats output as
             field amplitude (loss factor $10^{-dB/20}$, detector sees $|E|^2$).
@@ -374,15 +371,15 @@ class simulator:
         """
         # Validate mode
         try:
-            sim_mode = SimulationMode(mode)
+            exec_mode = ExecutionMode(mode)
         except ValueError:
-            valid = [m.value for m in SimulationMode]
+            valid = [m.value for m in ExecutionMode]
             raise ValueError(
-                f"Invalid simulation mode: {mode!r}. Valid modes are: {valid}"
+                f"Invalid execution mode: {mode!r}. Valid modes are: {valid}"
             ) from None
 
         # Delegate for MC mode
-        if sim_mode == SimulationMode.MC:
+        if exec_mode == ExecutionMode.MC:
             return self.run_mc(
                 input_feature,
                 optical_model,
@@ -391,11 +388,11 @@ class simulator:
                 input_domain=input_domain,
             )
 
-        # For ideal mode, effectively disable noise by using a noise-free config
+        # For deterministic mode, effectively disable noise by using a noise-free config
         effective_config = self._config
-        if sim_mode == SimulationMode.IDEAL:
+        if exec_mode == ExecutionMode.DETERMINISTIC:
             effective_config = SimulatorConfig(
-                mzi_insertion_loss=0.0,
+                layer_loss_db=0.0,
                 coupling_loss=0.0,
                 laser_rin=-155.0,
                 laser_linewidth=0.0,
@@ -403,7 +400,7 @@ class simulator:
                 detector_noise=False,
                 loss_model=LossModel.LAYER.value,
                 # Carry over remaining defaults
-                mzi_loss=self._config.mzi_loss,
+                component_loss_db=self._config.component_loss_db,
                 mzm_loss=self._config.mzm_loss,
                 phase_shifter_loss=self._config.phase_shifter_loss,
                 # Explicitly disable TIA/ADC non-idealities
@@ -426,7 +423,7 @@ class simulator:
             generator=generator,
             return_trace=return_trace,
             input_domain=input_domain,
-            model_output_domain=model_output_domain,
+            output_domain=output_domain,
         )
 
     def _run_internal(
@@ -439,7 +436,7 @@ class simulator:
         generator: Optional[torch.Generator] = None,
         return_trace: bool = False,
         input_domain: str = InputDomain.FIELD.value,
-        model_output_domain: Optional[str] = None,
+        output_domain: Optional[str] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace]:
         """Internal single-run simulation with an optional config override."""
         # Validate mutual exclusivity
@@ -477,33 +474,30 @@ class simulator:
         model_output_before_loss = optical_model(input_optical_field)
 
         # --- Resolve effective output domain ---
-        # 1. Use explicit override from run()
-        # 2. Use config field
-        # 3. Infer in AUTO mode
-        domain_str = model_output_domain or cfg.model_output_domain
-        eff_out_domain = ModelOutputDomain(domain_str)
+        domain_str = output_domain or cfg.output_domain
+        eff_out_domain = OutputDomain(domain_str)
 
-        if eff_out_domain == ModelOutputDomain.AUTO:
+        if eff_out_domain == OutputDomain.AUTO:
             # a) Check model hint attribute
             model_hint = getattr(optical_model, "output_domain", None)
-            if model_hint in (ModelOutputDomain.FIELD.value, ModelOutputDomain.POWER.value):
-                eff_out_domain = ModelOutputDomain(model_hint)
+            if model_hint in (OutputDomain.FIELD.value, OutputDomain.POWER.value):
+                eff_out_domain = OutputDomain(model_hint)
             # b) Infer from tensor properties
             elif torch.is_complex(model_output_before_loss):
-                eff_out_domain = ModelOutputDomain.FIELD
+                eff_out_domain = OutputDomain.FIELD
             elif torch.all(model_output_before_loss >= 0) and torch.all(torch.isfinite(model_output_before_loss)):
-                eff_out_domain = ModelOutputDomain.POWER
+                eff_out_domain = OutputDomain.POWER
             else:
-                eff_out_domain = ModelOutputDomain.FIELD
+                eff_out_domain = OutputDomain.FIELD
 
         # --- Insertion / coupling loss ---
         if cfg.loss_model == LossModel.COMPONENT.value:
             loss_db = self._compute_component_loss_for_config(optical_model, cfg)
         else:
             total_layers = _count_optical_layers(optical_model)
-            loss_db = total_layers * cfg.mzi_insertion_loss + cfg.coupling_loss
+            loss_db = total_layers * cfg.layer_loss_db + cfg.coupling_loss
 
-        if eff_out_domain == ModelOutputDomain.FIELD:
+        if eff_out_domain == OutputDomain.FIELD:
             # Field amplitude attenuation: 10^(-dB/20)
             loss_factor = 10 ** (-loss_db / 20)
             model_output_after_loss = model_output_before_loss * loss_factor
@@ -519,7 +513,7 @@ class simulator:
             bandwidth=cfg.detector_bandwidth,
             dark_current=cfg.detector_dark_current if cfg.detector_noise else 0.0,
             responsivity=cfg.detector_responsivity,
-            impendance=cfg.detector_impedance,
+            impedance=cfg.detector_impedance,
         )
         photocurrent = detector.simulate(
             detected_optical_power,
@@ -575,7 +569,7 @@ class simulator:
         """Compute component-level loss using *cfg* coefficients."""
         counts = _count_optical_components(optical_model)
         return (
-            counts["mzi"] * cfg.mzi_loss
+            counts["mzi"] * cfg.component_loss_db
             + counts["mzm"] * cfg.mzm_loss
             + counts["phase_shifter"] * cfg.phase_shifter_loss
             + cfg.coupling_loss
@@ -653,7 +647,7 @@ class simulator:
         optical_model: torch.nn.Module,
         *,
         sweep_params: Mapping[str, Sequence[Any]],
-        mode: str = SimulationMode.STOCHASTIC.value,
+        mode: str = ExecutionMode.STOCHASTIC.value,
         mc_samples: int = 100,
         seed: Optional[int] = None,
         input_domain: str = InputDomain.FIELD.value,
@@ -667,11 +661,11 @@ class simulator:
         optical_model :
             Optical model passed to every simulation call.
         sweep_params :
-            Mapping from parameter name to a sequence of values.  The Cartesian
-            product of all value sequences is enumerated.  Supported parameter
+            Mapping from parameter name to a sequence of values. The Cartesian
+            product of all value sequences is enumerated. Supported parameter
             names include ``"mode"``, ``"mc_samples"``, ``"seed"``,
             ``"input_domain"``, as well as any ``SimulatorConfig`` field
-            (e.g. ``"mzi_insertion_loss"``, ``"laser_rin"``).
+            (e.g. ``"layer_loss_db"``, ``"laser_rin"``).
         mode :
             Default simulation mode for each sweep point.  Can be overridden
             per point via ``sweep_params["mode"]``.
@@ -731,7 +725,7 @@ class simulator:
                     f.name: getattr(base, f.name) for f in SimulatorConfig.__dataclass_fields__.values()
                 }
                 merged_fields.update(config_overrides)
-                sweep_sim = simulator(config=SimulatorConfig(**merged_fields))
+                sweep_sim = Simulator(config=SimulatorConfig(**merged_fields))
             else:
                 sweep_sim = self
 
@@ -755,7 +749,3 @@ class simulator:
             })
 
         return results
-
-
-# Keep the original lowercase alias for backward compatibility
-simulator_legacy = simulator

@@ -8,7 +8,7 @@ import torch
 from torch.distributions import Bernoulli
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
-from .simulator import simulator as get_simulator
+from .simulator import Simulator as get_simulator
 
 class Differentiator(metaclass=abc.ABCMeta):
     """

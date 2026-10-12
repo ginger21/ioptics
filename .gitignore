@@ -37,6 +37,9 @@ ENV/
 env/
 .env
 .env.local
+.pixi/
+pixi.toml
+pixi.lock
 
 # Jupyter Notebook
 .ipynb_checkpoints

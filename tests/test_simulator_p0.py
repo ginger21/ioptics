@@ -22,14 +22,14 @@ import torch
 from ioptics.components import ADC, Detector, Laser, TIA
 from ioptics.layers import ArrayCore, FCArray, MeshCore
 from ioptics.simulator import (
+    ExecutionMode,
+    HardwareProfile,
     InputDomain,
     LossModel,
-    ModelOutputDomain,
-    SimulationMode,
+    OutputDomain,
     SimulationTrace,
+    Simulator,
     SimulatorConfig,
-    SimulatorProfile,
-    simulator,
 )
 
 
@@ -40,7 +40,7 @@ from ioptics.simulator import (
 class _LegacyParityModel(torch.nn.Module):
     """Wrap FCArray while forcing real-valued model outputs for legacy parity checks."""
 
-    output_domain = ModelOutputDomain.POWER.value
+    output_domain = OutputDomain.POWER.value
 
     def __init__(self) -> None:
         super().__init__()
@@ -100,7 +100,7 @@ def test_run_same_seed_reproducibility() -> None:
     model = _build_small_model()
     inp = _random_input()
 
-    sim = simulator()
+    sim = Simulator()
     out1 = sim.run(inp, model, seed=42)
     out2 = sim.run(inp, model, seed=42)
 
@@ -119,7 +119,7 @@ def test_run_different_seeds_differ() -> None:
         laser_noise=True,
         detector_noise=False,
     )
-    sim = simulator(config=noisy_cfg)
+    sim = Simulator(config=noisy_cfg)
     out1 = sim.run(inp, model, seed=1)
     out2 = sim.run(inp, model, seed=999)
 
@@ -127,7 +127,7 @@ def test_run_different_seeds_differ() -> None:
 
 
 def test_run_seed_and_generator_mutually_exclusive() -> None:
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
@@ -140,7 +140,7 @@ def test_run_seed_and_generator_mutually_exclusive() -> None:
 # ---------------------------------------------------------------------------
 
 def test_run_return_trace_structure() -> None:
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
@@ -167,7 +167,7 @@ def test_run_return_trace_structure() -> None:
 
 
 def test_run_return_trace_false_returns_tensor() -> None:
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
@@ -181,7 +181,7 @@ def test_run_return_trace_false_returns_tensor() -> None:
 # ---------------------------------------------------------------------------
 
 def test_run_input_domain_invalid_raises() -> None:
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
@@ -190,7 +190,7 @@ def test_run_input_domain_invalid_raises() -> None:
 
 
 def test_run_input_domain_field_default() -> None:
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
@@ -201,7 +201,7 @@ def test_run_input_domain_field_default() -> None:
 
 
 def test_run_input_domain_power_converts() -> None:
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
 
     # Create power input (positive real values)
@@ -219,7 +219,7 @@ def test_run_input_domain_power_converts() -> None:
 # ---------------------------------------------------------------------------
 
 def test_run_mc_output_structure() -> None:
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
@@ -235,7 +235,7 @@ def test_run_mc_output_structure() -> None:
 
 
 def test_run_mc_deterministic_with_seed() -> None:
-    sim = simulator(profile=SimulatorProfile.LAB.value)
+    sim = Simulator(profile=HardwareProfile.LAB.value)
     model = _build_small_model()
     inp = _random_input()
 
@@ -253,42 +253,42 @@ def test_run_mc_deterministic_with_seed() -> None:
 
 def test_profile_ideal_zero_loss() -> None:
     """Ideal profile should have zero insertion and coupling loss."""
-    sim = simulator(profile=SimulatorProfile.IDEAL.value)
-    assert sim.mzi_insertion_loss == 0.0
+    sim = Simulator(profile=HardwareProfile.IDEAL.value)
+    assert sim.layer_loss_db == 0.0
     assert sim.coupling_loss == 0.0
 
 
 def test_profile_hardware_like_nonzero_loss() -> None:
     """Hardware-like profile should have nonzero loss parameters."""
-    sim = simulator(profile=SimulatorProfile.HARDWARE_LIKE.value)
-    assert sim.mzi_insertion_loss > 0.0
+    sim = Simulator(profile=HardwareProfile.HARDWARE_LIKE.value)
+    assert sim.layer_loss_db > 0.0
     assert sim.coupling_loss > 0.0
 
 
 def test_custom_config_overrides_profile() -> None:
     """Providing a custom config should override the profile defaults."""
-    custom = SimulatorConfig(mzi_insertion_loss=5.0, coupling_loss=3.0)
-    sim = simulator(config=custom)
-    assert sim.mzi_insertion_loss == 5.0
+    custom = SimulatorConfig(layer_loss_db=5.0, coupling_loss=3.0)
+    sim = Simulator(config=custom)
+    assert sim.layer_loss_db == 5.0
     assert sim.coupling_loss == 3.0
 
 
 def test_simulatorconfig_from_profile_lab() -> None:
-    cfg = SimulatorConfig.from_profile(SimulatorProfile.LAB)
+    cfg = SimulatorConfig.from_profile(HardwareProfile.LAB)
     assert cfg.laser_noise is True
     assert cfg.detector_noise is True
 
 
 def test_simulatorconfig_from_profile_ideal() -> None:
-    cfg = SimulatorConfig.from_profile(SimulatorProfile.IDEAL)
+    cfg = SimulatorConfig.from_profile(HardwareProfile.IDEAL)
     assert cfg.laser_noise is False
     assert cfg.detector_noise is False
-    assert cfg.mzi_insertion_loss == 0.0
+    assert cfg.layer_loss_db == 0.0
 
 
-def test_backward_compat_default_simulator() -> None:
-    """simulator() with no args should still work and produce output."""
-    sim = simulator()
+def test_backward_compat_default_Simulator() -> None:
+    """Simulator() with no args should still work and produce output."""
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
@@ -304,17 +304,17 @@ def test_component_loss_differs_from_layer_loss() -> None:
     """Component loss model should produce different loss than layer-count model."""
     model = _build_small_model()  # FCArray(4, 4) => 16 MZMs, 1 ArrayCore
 
-    # Layer model: 1 core layer * mzi_insertion_loss + coupling_loss
-    sim_layer = simulator(config=SimulatorConfig(
-        mzi_insertion_loss=1.0,
+    # Layer model: 1 core layer * layer_loss_db + coupling_loss
+    sim_layer = Simulator(config=SimulatorConfig(
+        layer_loss_db=1.0,
         coupling_loss=0.5,
         loss_model=LossModel.LAYER.value,
     ))
     layer_loss_db = sim_layer._compute_loss_db(model)
 
     # Component model: 16 MZMs * mzm_loss + coupling_loss
-    sim_comp = simulator(config=SimulatorConfig(
-        mzi_loss=0.4,
+    sim_comp = Simulator(config=SimulatorConfig(
+        component_loss_db=0.4,
         mzm_loss=0.4,
         phase_shifter_loss=0.15,
         coupling_loss=0.5,
@@ -335,13 +335,13 @@ def test_component_loss_matches_expected_counted_loss() -> None:
     model = _build_small_model()  # FCArray(4, 4) => 16 MZMs
 
     cfg = SimulatorConfig(
-        mzi_loss=0.6,
+        component_loss_db=0.6,
         mzm_loss=0.3,
         phase_shifter_loss=0.1,
         coupling_loss=0.8,
         loss_model=LossModel.COMPONENT.value,
     )
-    sim = simulator(config=cfg)
+    sim = Simulator(config=cfg)
 
     expected = 16 * cfg.mzm_loss + cfg.coupling_loss  # 16*0.3 + 0.8 = 5.6
     actual = sim._compute_loss_db(model)
@@ -350,8 +350,8 @@ def test_component_loss_matches_expected_counted_loss() -> None:
 
 def test_component_model_simulation_produces_output() -> None:
     """A full simulation run with component loss model should succeed."""
-    sim = simulator(config=SimulatorConfig(
-        mzi_loss=0.6,
+    sim = Simulator(config=SimulatorConfig(
+        component_loss_db=0.6,
         mzm_loss=0.4,
         phase_shifter_loss=0.15,
         coupling_loss=0.5,
@@ -367,7 +367,7 @@ def test_component_model_simulation_produces_output() -> None:
 
 def test_component_loss_default_backward_compat() -> None:
     """Default simulator should use layer loss model (backward compat)."""
-    sim = simulator()
+    sim = Simulator()
     assert sim.loss_model == LossModel.LAYER.value
 
 
@@ -383,13 +383,13 @@ def test_mode_ideal_deterministic_with_noisy_config() -> None:
         laser_noise=True,
         detector_noise=True,
     )
-    sim = simulator(config=noisy_cfg)
+    sim = Simulator(config=noisy_cfg)
     model = _build_small_model()
     inp = _random_input()
 
-    out1 = sim.run(inp, model, mode=SimulationMode.IDEAL.value, seed=42)
-    out2 = sim.run(inp, model, mode=SimulationMode.IDEAL.value, seed=42)
-    out3 = sim.run(inp, model, mode=SimulationMode.IDEAL.value, seed=99)
+    out1 = sim.run(inp, model, mode=ExecutionMode.DETERMINISTIC.value, seed=42)
+    out2 = sim.run(inp, model, mode=ExecutionMode.DETERMINISTIC.value, seed=42)
+    out3 = sim.run(inp, model, mode=ExecutionMode.DETERMINISTIC.value, seed=99)
 
     torch.testing.assert_close(out1, out2)
     torch.testing.assert_close(out1, out3, msg="Ideal mode should be deterministic regardless of seed")
@@ -397,21 +397,21 @@ def test_mode_ideal_deterministic_with_noisy_config() -> None:
 
 def test_mode_stochastic_produces_output() -> None:
     """Stochastic mode (default) should produce a tensor output."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
-    output = sim.run(inp, model, mode=SimulationMode.STOCHASTIC.value, seed=7)
+    output = sim.run(inp, model, mode=ExecutionMode.STOCHASTIC.value, seed=7)
     assert isinstance(output, torch.Tensor)
 
 
 def test_mode_mc_from_run_returns_expected_structure() -> None:
     """mode='mc' from run() should return the same MC aggregate structure."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
-    result = sim.run(inp, model, mode=SimulationMode.MC.value, seed=42, mc_samples=15)
+    result = sim.run(inp, model, mode=ExecutionMode.MC.value, seed=42, mc_samples=15)
 
     assert isinstance(result, dict)
     for key in ("mean", "std", "p05", "p95", "samples"):
@@ -421,12 +421,12 @@ def test_mode_mc_from_run_returns_expected_structure() -> None:
 
 def test_mode_mc_sample_count_configurable() -> None:
     """mc_samples parameter should control the number of samples."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
-    result_5 = sim.run(inp, model, mode=SimulationMode.MC.value, seed=42, mc_samples=5)
-    result_20 = sim.run(inp, model, mode=SimulationMode.MC.value, seed=42, mc_samples=20)
+    result_5 = sim.run(inp, model, mode=ExecutionMode.MC.value, seed=42, mc_samples=5)
+    result_20 = sim.run(inp, model, mode=ExecutionMode.MC.value, seed=42, mc_samples=20)
 
     assert result_5["samples"].shape[0] == 5
     assert result_20["samples"].shape[0] == 20
@@ -434,31 +434,31 @@ def test_mode_mc_sample_count_configurable() -> None:
 
 def test_mode_invalid_raises() -> None:
     """Invalid mode values should raise ValueError with a clear message."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = _random_input()
 
-    with pytest.raises(ValueError, match="Invalid simulation mode"):
+    with pytest.raises(ValueError, match="Invalid execution mode"):
         sim.run(inp, model, mode="bogus")
 
-    with pytest.raises(ValueError, match="ideal"):
+    with pytest.raises(ValueError, match="deterministic"):
         sim.run(inp, model, mode="BOGUS")
 
 
-def test_mode_ideal_zero_loss() -> None:
-    """Ideal mode should apply zero loss (no attenuation)."""
+def test_mode_deterministic_zero_loss() -> None:
+    """Deterministic mode should apply zero loss (no attenuation)."""
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
-    # Non-ideal config but ideal mode
-    sim = simulator(config=SimulatorConfig(
-        mzi_insertion_loss=5.0,
+    # Non-ideal config but deterministic mode
+    sim = Simulator(config=SimulatorConfig(
+        layer_loss_db=5.0,
         coupling_loss=5.0,
         laser_noise=False,
         detector_noise=False,
     ))
 
-    output = sim.run(inp, model, mode=SimulationMode.IDEAL.value, seed=7)
+    output = sim.run(inp, model, mode=ExecutionMode.DETERMINISTIC.value, seed=7)
     # In ideal mode, loss is zero, so output should equal model output
     # (before ADC quantization noise, which is also disabled in ideal mode)
     assert isinstance(output, torch.Tensor)
@@ -470,14 +470,14 @@ def test_mode_ideal_zero_loss() -> None:
 
 def test_sweep_combination_count() -> None:
     """Sweep should produce Cartesian product count of results."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
     results = sim.run_sweep(
         inp, model,
         sweep_params={
-            "mzi_insertion_loss": [0.5, 1.0, 2.0],
+            "layer_loss_db": [0.5, 1.0, 2.0],
             "coupling_loss": [0.1, 0.5],
         },
         seed=42,
@@ -489,13 +489,13 @@ def test_sweep_combination_count() -> None:
 
 def test_sweep_params_structure() -> None:
     """Each sweep result should contain 'params' and 'output' keys."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
     results = sim.run_sweep(
         inp, model,
-        sweep_params={"mzi_insertion_loss": [0.5, 1.0]},
+        sweep_params={"layer_loss_db": [0.5, 1.0]},
         seed=0,
     )
 
@@ -504,17 +504,17 @@ def test_sweep_params_structure() -> None:
         assert "output" in entry
         assert isinstance(entry["params"], dict)
         assert isinstance(entry["output"], torch.Tensor)
-        assert "mzi_insertion_loss" in entry["params"]
+        assert "layer_loss_db" in entry["params"]
 
 
 def test_sweep_deterministic_with_seed() -> None:
     """Sweep with fixed seed should produce deterministic outputs."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
     sweep_kwargs = {
-        "sweep_params": {"mzi_insertion_loss": [0.5, 1.0]},
+        "sweep_params": {"layer_loss_db": [0.5, 1.0]},
         "seed": 12345,
     }
 
@@ -529,14 +529,14 @@ def test_sweep_deterministic_with_seed() -> None:
 
 def test_sweep_with_mc_mode() -> None:
     """Sweep should work with mode='mc'."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
     results = sim.run_sweep(
         inp, model,
-        sweep_params={"mzi_insertion_loss": [0.5, 1.0]},
-        mode=SimulationMode.MC.value,
+        sweep_params={"layer_loss_db": [0.5, 1.0]},
+        mode=ExecutionMode.MC.value,
         mc_samples=5,
         seed=42,
     )
@@ -551,13 +551,13 @@ def test_sweep_with_mc_mode() -> None:
 
 def test_sweep_with_mode_override() -> None:
     """Sweep should allow overriding mode per combination."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
     results = sim.run_sweep(
         inp, model,
-        sweep_params={"mode": [SimulationMode.STOCHASTIC.value, SimulationMode.IDEAL.value]},
+        sweep_params={"mode": [ExecutionMode.STOCHASTIC.value, ExecutionMode.DETERMINISTIC.value]},
         seed=7,
     )
 
@@ -569,7 +569,7 @@ def test_sweep_with_mode_override() -> None:
 
 def test_sweep_empty_params_raises() -> None:
     """Sweep with empty sweep_params should raise ValueError."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
@@ -579,7 +579,7 @@ def test_sweep_empty_params_raises() -> None:
 
 def test_sweep_unknown_param_raises() -> None:
     """Sweep with an unknown parameter name should raise ValueError."""
-    sim = simulator()
+    sim = Simulator()
     model = _build_small_model()
     inp = torch.ones(4, dtype=torch.complex64)
 
@@ -596,10 +596,10 @@ def test_non_idealities_affect_stochastic_output() -> None:
     model = _build_small_model()
     inp = _random_input()
 
-    sim_default = simulator()
-    out_default = sim_default.run(inp, model, seed=42, mode=SimulationMode.STOCHASTIC.value)
+    sim_default = Simulator()
+    out_default = sim_default.run(inp, model, seed=42, mode=ExecutionMode.STOCHASTIC.value)
 
-    sim_nonideal = simulator(config=SimulatorConfig(
+    sim_nonideal = Simulator(config=SimulatorConfig(
         tia_gain_error=2.0,
         tia_offset=0.5,
         tia_noise_std=0.01,
@@ -609,7 +609,7 @@ def test_non_idealities_affect_stochastic_output() -> None:
         laser_noise=True,
         laser_rin=-60.0,
     ))
-    out_nonideal = sim_nonideal.run(inp, model, seed=42, mode=SimulationMode.STOCHASTIC.value)
+    out_nonideal = sim_nonideal.run(inp, model, seed=42, mode=ExecutionMode.STOCHASTIC.value)
 
     assert not torch.allclose(out_default, out_nonideal), (
         "Non-ideal config should produce different output"
@@ -634,11 +634,11 @@ def test_ideal_mode_bypasses_non_idealities() -> None:
         laser_noise=True,
         detector_noise=True,
     )
-    sim_extreme = simulator(config=cfg_extreme)
+    sim_extreme = Simulator(config=cfg_extreme)
 
-    out1 = sim_extreme.run(inp, model, mode=SimulationMode.IDEAL.value, seed=42)
-    out2 = sim_extreme.run(inp, model, mode=SimulationMode.IDEAL.value, seed=42)
-    out3 = sim_extreme.run(inp, model, mode=SimulationMode.IDEAL.value, seed=9999)
+    out1 = sim_extreme.run(inp, model, mode=ExecutionMode.DETERMINISTIC.value, seed=42)
+    out2 = sim_extreme.run(inp, model, mode=ExecutionMode.DETERMINISTIC.value, seed=42)
+    out3 = sim_extreme.run(inp, model, mode=ExecutionMode.DETERMINISTIC.value, seed=9999)
 
     torch.testing.assert_close(out1, out2)
     torch.testing.assert_close(out1, out3, msg="Ideal mode ignores non-ideal settings")
@@ -650,7 +650,7 @@ def test_tia_saturation_clamps_output() -> None:
     # Use a large input to generate meaningful photocurrent/voltage.
     inp = torch.ones(4, dtype=torch.complex64) * 10.0
 
-    sim_clamped = simulator(config=SimulatorConfig(
+    sim_clamped = Simulator(config=SimulatorConfig(
         tia_saturation_max=1e-6,
         tia_saturation_min=0.0,
         tia_gain_error=1.0,
@@ -658,7 +658,7 @@ def test_tia_saturation_clamps_output() -> None:
         tia_noise_std=0.0,
     ))
     # Use a tiny ADC range so the clamped voltage survives quantization.
-    sim_small_range = simulator(config=SimulatorConfig(
+    sim_small_range = Simulator(config=SimulatorConfig(
         tia_saturation_max=1e-6,
         tia_saturation_min=0.0,
         tia_gain_error=1.0,
@@ -669,10 +669,10 @@ def test_tia_saturation_clamps_output() -> None:
     ))
 
     _, trace_clamped = sim_clamped.run(
-        inp, model, seed=7, return_trace=True, mode=SimulationMode.STOCHASTIC.value,
+        inp, model, seed=7, return_trace=True, mode=ExecutionMode.STOCHASTIC.value,
     )
     out_small = sim_small_range.run(
-        inp, model, seed=7, mode=SimulationMode.STOCHASTIC.value,
+        inp, model, seed=7, mode=ExecutionMode.STOCHASTIC.value,
     )
 
     # The TIA voltage in the trace should be clamped to <= saturation_max
@@ -702,11 +702,11 @@ def test_adc_inl_has_observable_effect() -> None:
         adc_transition_noise_lsb=0.0,
     )
 
-    sim_baseline = simulator(config=SimulatorConfig(**base_kwargs, adc_inl_coefficient=0.0))
-    sim_inl = simulator(config=SimulatorConfig(**base_kwargs, adc_inl_coefficient=1000.0))
+    sim_baseline = Simulator(config=SimulatorConfig(**base_kwargs, adc_inl_coefficient=0.0))
+    sim_inl = Simulator(config=SimulatorConfig(**base_kwargs, adc_inl_coefficient=1000.0))
 
-    out_baseline = sim_baseline.run(inp, model, seed=7, mode=SimulationMode.STOCHASTIC.value)
-    out_inl = sim_inl.run(inp, model, seed=7, mode=SimulationMode.STOCHASTIC.value)
+    out_baseline = sim_baseline.run(inp, model, seed=7, mode=ExecutionMode.STOCHASTIC.value)
+    out_inl = sim_inl.run(inp, model, seed=7, mode=ExecutionMode.STOCHASTIC.value)
 
     assert not torch.allclose(out_baseline, out_inl), (
         f"INL should change output: baseline={out_baseline}, inl={out_inl}"
@@ -729,11 +729,11 @@ def test_adc_dnl_has_observable_effect() -> None:
         adc_inl_coefficient=0.0,
     )
 
-    sim_baseline = simulator(config=SimulatorConfig(**base_kwargs, adc_transition_noise_lsb=0.0))
-    sim_dnl = simulator(config=SimulatorConfig(**base_kwargs, adc_transition_noise_lsb=100.0))
+    sim_baseline = Simulator(config=SimulatorConfig(**base_kwargs, adc_transition_noise_lsb=0.0))
+    sim_dnl = Simulator(config=SimulatorConfig(**base_kwargs, adc_transition_noise_lsb=100.0))
 
-    out_baseline = sim_baseline.run(inp, model, seed=7, mode=SimulationMode.STOCHASTIC.value)
-    out_dnl = sim_dnl.run(inp, model, seed=7, mode=SimulationMode.STOCHASTIC.value)
+    out_baseline = sim_baseline.run(inp, model, seed=7, mode=ExecutionMode.STOCHASTIC.value)
+    out_dnl = sim_dnl.run(inp, model, seed=7, mode=ExecutionMode.STOCHASTIC.value)
 
     assert not torch.allclose(out_baseline, out_dnl), (
         f"DNL should change output: baseline={out_baseline}, dnl={out_dnl}"
@@ -745,7 +745,7 @@ def test_deterministic_with_seed_stochastic_non_ideal() -> None:
     model = _build_small_model()
     inp = _random_input()
 
-    sim = simulator(config=SimulatorConfig(
+    sim = Simulator(config=SimulatorConfig(
         tia_gain_error=1.5,
         tia_offset=0.1,
         tia_noise_std=0.001,
@@ -755,8 +755,8 @@ def test_deterministic_with_seed_stochastic_non_ideal() -> None:
         detector_noise=True,
     ))
 
-    out1 = sim.run(inp, model, seed=12345, mode=SimulationMode.STOCHASTIC.value)
-    out2 = sim.run(inp, model, seed=12345, mode=SimulationMode.STOCHASTIC.value)
+    out1 = sim.run(inp, model, seed=12345, mode=ExecutionMode.STOCHASTIC.value)
+    out2 = sim.run(inp, model, seed=12345, mode=ExecutionMode.STOCHASTIC.value)
 
     torch.testing.assert_close(out1, out2)
 
@@ -766,7 +766,7 @@ def test_deterministic_with_seed_mc_non_ideal() -> None:
     model = _build_small_model()
     inp = _random_input()
 
-    sim = simulator(config=SimulatorConfig(
+    sim = Simulator(config=SimulatorConfig(
         tia_noise_std=0.001,
         adc_inl_coefficient=10.0,
         adc_transition_noise_lsb=5.0,
@@ -788,8 +788,8 @@ def test_legacy_parameter_set_matches_initial_pipeline_behavior() -> None:
     inp = torch.tensor([2.0, 0.7, 1.3, 3.1], dtype=torch.float32)
     seed = 2026
 
-    current_sim = simulator(config=SimulatorConfig(
-        mzi_insertion_loss=1.2,
+    current_sim = Simulator(config=SimulatorConfig(
+        layer_loss_db=1.2,
         coupling_loss=0.5,
         laser_noise=True,
         detector_noise=True,
@@ -797,7 +797,7 @@ def test_legacy_parameter_set_matches_initial_pipeline_behavior() -> None:
     current_output = current_sim.run(
         inp,
         model,
-        mode=SimulationMode.STOCHASTIC.value,
+        mode=ExecutionMode.STOCHASTIC.value,
         seed=seed,
     )
     initial_output = _reference_initial_simulator_run(inp, model, seed=seed)
@@ -811,14 +811,14 @@ def test_run_auto_domain_selects_field_for_complex() -> None:
     inp = _random_input()
     seed = 42
 
-    sim = simulator()
+    sim = Simulator()
 
     # Run with AUTO (should infer FIELD since FCArray output is complex)
     out_auto = sim.run(
         inp,
         model,
         seed=seed,
-        model_output_domain=ModelOutputDomain.AUTO.value,
+        output_domain=OutputDomain.AUTO.value,
     )
 
     # Run with explicit FIELD
@@ -826,7 +826,7 @@ def test_run_auto_domain_selects_field_for_complex() -> None:
         inp,
         model,
         seed=seed,
-        model_output_domain=ModelOutputDomain.FIELD.value,
+        output_domain=OutputDomain.FIELD.value,
     )
 
     torch.testing.assert_close(out_auto, out_field)

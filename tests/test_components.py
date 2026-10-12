@@ -127,3 +127,8 @@ def test_adc_quantizes_and_clips() -> None:
 
     expected = torch.tensor([0.0, 0.0, 0.5, 0.75])
     torch.testing.assert_close(quantized, expected)
+
+
+def test_detector_impedance() -> None:
+    component = Detector(impedance=75.0)
+    assert component.impedance == 75.0

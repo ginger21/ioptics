@@ -407,7 +407,7 @@ class Detector(OpticalComponent):
         bandwidth: float = 1e9,
         dark_current: float = 1e-9,
         responsivity: float = 1.0e-3,
-        impendance=50,
+        impedance: float = 50.0,
     ):
         super().__init__([], dof=1)
         if bandwidth < 0:
@@ -416,16 +416,16 @@ class Detector(OpticalComponent):
             raise ValueError("dark_current must be non-negative")
         if responsivity < 0:
             raise ValueError("responsivity must be non-negative")
-        if impendance <= 0:
-            raise ValueError("impendance must be positive")
+        if impedance <= 0:
+            raise ValueError("impedance must be positive")
         self.bandwidth = bandwidth
         self.dark_current = dark_current  # 1e-9: 1 nA @ Si Room temperature
         self.responsivity = responsivity  # 1.0 A/W (Si @ 1550nm), 1e-3 A/mW
-        self.impendance = impendance  # 50 ohm
+        self.impedance = impedance  # 50 ohm
 
     def __repr__(self):
-        return "<Detector, bandwidth = {}, dark_current = {}, responsivity = {}, impendance = {}>".format(
-            self.bandwidth, self.dark_current, self.responsivity, self.impendance
+        return "<Detector, bandwidth = {}, dark_current = {}, responsivity = {}, impedance = {}>".format(
+            self.bandwidth, self.dark_current, self.responsivity, self.impedance
         )
 
     def total_noise(
@@ -438,9 +438,9 @@ class Detector(OpticalComponent):
         # dark_noise_std = np.sqrt(2 * q * self.dark_current * self.bandwidth)
         dark_noise_var = 2 * q * self.dark_current * self.bandwidth
         # thermal_noise_std = np.sqrt(
-        #     4 * k_b * temperature * self.bandwidth / self.impendance
+        #     4 * k_b * temperature * self.bandwidth / self.impedance
         # )
-        thermal_noise_var = 4 * k_b * temperature * self.bandwidth / self.impendance
+        thermal_noise_var = 4 * k_b * temperature * self.bandwidth / self.impedance
 
         total_noise_var = shot_noise_var + dark_noise_var + thermal_noise_var
         total_noise_std = torch.sqrt(total_noise_var)
