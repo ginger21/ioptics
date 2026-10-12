@@ -308,13 +308,8 @@ def test_physical_bernoulli_differentiator_raises_when_loss_is_not_scalar():
         return outputs  # Return non-scalar tensor
 
     differentiator = PhysicalBernoulliDifferentiator()
-    try:
+    with pytest.raises(ValueError, match="loss_fn must return a scalar tensor"):
         differentiator.differentiate(model, inputs, non_scalar_loss_fn, y_label=targets)
-    except ValueError as e:
-        assert "loss_fn must return a scalar tensor" in str(e)
-    except RuntimeError:
-        # Simulator may fail before validation due to complex type handling - skip in this case
-        pytest.skip("Simulator failed before loss validation due to complex type handling")
 
 
 def test_differentiators_reject_nonfinite_loss():

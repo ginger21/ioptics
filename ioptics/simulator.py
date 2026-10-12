@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -89,7 +89,7 @@ class SimulatorConfig:
 
     # ADC parameters
     adc_bits: int = 12
-    adc_v_range: float = 60.0           # Volts
+    adc_v_range: float = 2.0            # Volts
 
     # Component noise toggles per profile
     laser_noise: bool = False
@@ -111,6 +111,10 @@ class SimulatorConfig:
     # Domain interpretation
     input_domain: str = InputDomain.FIELD.value
     output_domain: str = OutputDomain.AUTO.value
+
+    # Auto-gain & digital normalization options
+    auto_gain: bool = False
+    normalize: bool = False
 
     @staticmethod
     def from_profile(profile: HardwareProfile | str) -> SimulatorConfig:
@@ -238,6 +242,8 @@ def _apply_adc_non_idealities(
     generator: Optional[torch.Generator],
 ) -> torch.Tensor:
     """Apply ADC non-idealities and quantize a voltage tensor."""
+    if torch.is_complex(voltage):
+        voltage = voltage.real
     lsb = v_range / (2 ** bits)
 
     # Gain / offset on analog input
@@ -272,6 +278,8 @@ class Simulator:
         config: Optional[SimulatorConfig] = None,
         *,
         profile: str = HardwareProfile.IDEAL.value,
+        auto_gain: Optional[bool] = None,
+        normalize: Optional[bool] = None,
     ) -> None:
         # Resolve profile
         self._profile = HardwareProfile(profile)
@@ -280,6 +288,14 @@ class Simulator:
             self._config = config
         else:
             self._config = SimulatorConfig.from_profile(self._profile)
+
+        overrides = {}
+        if auto_gain is not None:
+            overrides["auto_gain"] = auto_gain
+        if normalize is not None:
+            overrides["normalize"] = normalize
+        if overrides:
+            self._config = replace(self._config, **overrides)
 
         # Convenience aliases
         self.temperature: float = self._config.temperature
@@ -328,6 +344,8 @@ class Simulator:
         input_domain: str = InputDomain.FIELD.value,
         mc_samples: int = 100,
         output_domain: Optional[str] = None,
+        auto_gain: Optional[bool] = None,
+        normalize: Optional[bool] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace] | Dict[str, Any]:
         """Run a forward simulation.
 
@@ -424,6 +442,8 @@ class Simulator:
             return_trace=return_trace,
             input_domain=input_domain,
             output_domain=output_domain,
+            auto_gain=auto_gain,
+            normalize=normalize,
         )
 
     def _run_internal(
@@ -437,6 +457,8 @@ class Simulator:
         return_trace: bool = False,
         input_domain: str = InputDomain.FIELD.value,
         output_domain: Optional[str] = None,
+        auto_gain: Optional[bool] = None,
+        normalize: Optional[bool] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace]:
         """Internal single-run simulation with an optional config override."""
         # Validate mutual exclusivity
@@ -459,13 +481,19 @@ class Simulator:
         elif domain == InputDomain.POWER:
             # Power -> field: E = sqrt(P)  (phase assumed zero)
             pwr = input_feature.real if torch.is_complex(input_feature) else input_feature
+            min_pwr = torch.min(pwr).item()
+            if min_pwr < -1e-6:
+                raise ValueError(
+                    f"Input optical power must be non-negative, but got minimum value {min_pwr:.3e}."
+                )
+            pwr = torch.clamp(pwr, min=0.0)
             E_field = torch.sqrt(pwr.to(torch.float32))
         else:
             raise ValueError(f"Invalid input_domain: {input_domain!r}")
 
         # --- Laser ---
         laser = Laser(
-            RIN=cfg.laser_rin if cfg.laser_noise else -155.0,
+            RIN=cfg.laser_rin if cfg.laser_noise else -float("inf"),
             linewidth=cfg.laser_linewidth if cfg.laser_noise else 0.0,
         )
         input_optical_field = laser.simulate(E_field, generator=effective_gen)
@@ -482,9 +510,17 @@ class Simulator:
             model_hint = getattr(optical_model, "output_domain", None)
             if model_hint in (OutputDomain.FIELD.value, OutputDomain.POWER.value):
                 eff_out_domain = OutputDomain(model_hint)
-            # b) Infer from tensor properties
+            # b) Complex tensors represent optical fields, never optical power
             elif torch.is_complex(model_output_before_loss):
                 eff_out_domain = OutputDomain.FIELD
+            # c) Check if last module in sequential/composite model is a detector/power conversion
+            elif (
+                isinstance(optical_model, torch.nn.Sequential)
+                and len(optical_model) > 0
+                and optical_model[-1].__class__.__name__ in ("Abs", "AbsSquared", "SquareActivation")
+            ):
+                eff_out_domain = OutputDomain.POWER
+            # d) Infer from tensor properties
             elif torch.all(model_output_before_loss >= 0) and torch.all(torch.isfinite(model_output_before_loss)):
                 eff_out_domain = OutputDomain.POWER
             else:
@@ -506,7 +542,17 @@ class Simulator:
             # Power attenuation: 10^(-dB/10)
             loss_factor = 10 ** (-loss_db / 10)
             model_output_after_loss = model_output_before_loss * loss_factor
-            detected_optical_power = model_output_after_loss
+            if torch.is_complex(model_output_after_loss):
+                # Safeguard: if user forced POWER mode on complex output, convert to intensity
+                detected_optical_power = torch.abs(model_output_after_loss) ** 2
+            else:
+                min_pwr = torch.min(model_output_after_loss).item()
+                if min_pwr < -1e-6:
+                    raise ValueError(
+                        f"Model output optical power must be non-negative, but got minimum value {min_pwr:.3e}. "
+                        "Check model architecture or output domain configuration."
+                    )
+                detected_optical_power = torch.clamp(model_output_after_loss, min=0.0)
 
         # --- Detector ---
         detector = Detector(
@@ -524,7 +570,19 @@ class Simulator:
         )
 
         # --- TIA ---
-        tia = TIA(transimpedance=cfg.tia_transimpedance)
+        eff_auto_gain = auto_gain if auto_gain is not None else cfg.auto_gain
+        if eff_auto_gain:
+            # Auto-gain: dynamically scale transimpedance so maximum signal reaches ~85% of ADC range
+            max_current = torch.max(photocurrent).item()
+            if max_current > 1e-9:
+                target_voltage = 0.85 * cfg.adc_v_range
+                eff_transimpedance = min(target_voltage / max_current, 1e7)
+            else:
+                eff_transimpedance = cfg.tia_transimpedance
+        else:
+            eff_transimpedance = cfg.tia_transimpedance
+
+        tia = TIA(transimpedance=eff_transimpedance)
         voltage = tia.simulate(photocurrent)
 
         # Apply TIA non-idealities (P2)
@@ -549,6 +607,17 @@ class Simulator:
             inl_coefficient=cfg.adc_inl_coefficient,
             generator=effective_gen,
         )
+
+        # --- Digital Normalization ---
+        eff_normalize = normalize if normalize is not None else cfg.normalize
+        if eff_normalize:
+            if eff_auto_gain:
+                norm_scale = 0.85 * cfg.adc_v_range
+            else:
+                norm_scale = cfg.detector_responsivity * eff_transimpedance
+                if norm_scale <= 0.0:
+                    norm_scale = cfg.adc_v_range
+            output = torch.clamp(output / norm_scale, 0.0, 1.0)
 
         if return_trace:
             trace = SimulationTrace(

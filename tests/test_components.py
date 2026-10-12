@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from ioptics.components import (
@@ -132,3 +133,71 @@ def test_adc_quantizes_and_clips() -> None:
 def test_detector_impedance() -> None:
     component = Detector(impedance=75.0)
     assert component.impedance == 75.0
+
+
+def test_laser_preserves_original_field_phase() -> None:
+    """Laser should preserve input complex field phase rather than discarding it."""
+    # Linewidth 0 means zero phase jitter
+    laser = Laser(RIN=-155, linewidth=0.0)
+    # Phase = pi / 4
+    input_field = torch.tensor([1.0 + 1.0j], dtype=torch.complex64)
+    output = laser.simulate(input_field)
+
+    assert not torch.any(torch.isnan(output))
+    # Original phase should be preserved
+    torch.testing.assert_close(torch.angle(output), torch.angle(input_field), atol=1e-5, rtol=1e-5)
+
+
+def test_laser_rin_negative_power_clamped_no_nan() -> None:
+    """Large RIN noise on low input power should clamp cleanly and never produce NaN."""
+    # High RIN to trigger negative values in input_power + RIN_noise
+    laser = Laser(RIN=-50, linewidth=1e5)
+    input_field = torch.tensor([1e-6 + 1e-6j], dtype=torch.complex64)
+    # Run multiple times to exercise random noise distribution
+    for _ in range(50):
+        output = laser.simulate(input_field)
+        assert not torch.any(torch.isnan(output)), "Laser output produced NaN!"
+        assert not torch.any(torch.isinf(output)), "Laser output produced Inf!"
+
+
+def test_detector_shot_noise_is_channel_independent() -> None:
+    """Shot noise variance must be proportional to each channel's photocurrent, not global mean."""
+    detector = Detector(dark_current=0.0, bandwidth=1e9)
+    # Channel 0 has zero power (dark), Channel 1 has high power
+    power = torch.tensor([0.0, 100.0], dtype=torch.float32)
+
+    # Sample multiple times to calculate empirical noise variance for each channel
+    samples = []
+    for _ in range(200):
+        # Temperature = 0 to isolate shot noise from thermal noise
+        current = detector.simulate(power, q=1.602e-19, k_b=0.0, temperature=0.0)
+        samples.append(current)
+
+    samples_t = torch.stack(samples)  # (200, 2)
+    var = samples_t.var(dim=0)
+
+    # Channel 0 (dark) shot noise variance should be 0 since dark_current is 0
+    assert var[0].item() == 0.0, f"Dark channel had non-zero shot noise: {var[0].item()}"
+    # Channel 1 (illuminated) shot noise variance must be positive
+    assert var[1].item() > 0.0, f"Illuminated channel had zero variance: {var[1].item()}"
+
+
+def test_detector_rejects_negative_optical_power() -> None:
+    """Detector should raise ValueError on significantly negative optical power."""
+    detector = Detector()
+    invalid_power = torch.tensor([-0.5, 1.0], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="Optical power must be non-negative"):
+        detector.simulate(invalid_power, q=1.602e-19, k_b=1.381e-23, temperature=300)
+
+
+def test_laser_warns_when_rin_noise_produces_negative_power() -> None:
+    """Laser should emit a UserWarning when high RIN on weak power causes negative values."""
+    laser = Laser(RIN=-50, linewidth=1e5)
+    field = torch.ones(4, dtype=torch.complex64)
+
+    with pytest.warns(UserWarning, match="Laser RIN noise produced negative optical power"):
+        output = laser.simulate(field)
+    assert not torch.any(torch.isnan(output))
+
+

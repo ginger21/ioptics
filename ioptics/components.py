@@ -1,3 +1,4 @@
+import warnings
 from typing import List, Optional
 
 import numpy as np
@@ -361,40 +362,60 @@ class Laser(OpticalComponent):
     def RIN_noise(
         self, power, frequency: float = 1e9, generator: Optional[torch.Generator] = None
     ):
+        if self.RIN <= -200.0 or self.RIN == -float("inf"):
+            return torch.zeros_like(power.real)
         RIN_linear = 10 ** (self.RIN / 10)
         noise_variance = RIN_linear * power**2 * frequency
         noise_std = torch.sqrt(noise_variance)
         noise = torch.randn(power.shape, dtype=power.dtype, device=power.device, generator=generator)
         noise_power = noise * noise_std
-        # noise_power = np.random.normal(0, np.sqrt(noise_variance), size=power.shape)
-
         return noise_power
 
     def phase_noise(
         self, power, dt: float = 1e-12, generator: Optional[torch.Generator] = None
     ):
+        if self.linewidth <= 0.0:
+            return torch.zeros_like(power.real)
         phase_variance = 2 * torch.pi * self.linewidth * dt
         phase_std = torch.sqrt(
             torch.tensor(phase_variance, dtype=power.dtype, device=power.device)
         )
         noise = torch.randn(power.real.shape, dtype=power.real.dtype, device=power.device, generator=generator)
-        phase_noise = noise * phase_std  # 相位是实数
-
-        # phase_variance = 2 * np.pi * self.linewidth * dt
-        # phase_noise = np.random.normal(0, np.sqrt(phase_variance), size=power.shape)
+        phase_noise = noise * phase_std
 
         return phase_noise
 
     def simulate(self, E, generator: Optional[torch.Generator] = None):
         if not torch.is_tensor(E):
             raise TypeError("E must be a torch.Tensor")
-        input_power = torch.abs(E) ** 2
-        input_power = input_power + self.RIN_noise(input_power, generator=generator)
+        input_power_raw = torch.abs(E) ** 2
+        noisy_power = input_power_raw + self.RIN_noise(input_power_raw, generator=generator)
+        min_pwr = torch.min(noisy_power).item()
+        if min_pwr < -1e-6:
+            neg_mask = noisy_power < 0
+            neg_ratio = neg_mask.float().mean().item()
+            warnings.warn(
+                f"Laser RIN noise produced negative optical power (min: {min_pwr:.3e}, "
+                f"affected: {neg_ratio*100:.1f}%). Negative values are clamped to 0 to prevent NaN, "
+                "which indicates the small-signal Gaussian RIN approximation has broken down "
+                "at low optical power or excessive noise levels.",
+                category=UserWarning,
+                stacklevel=2,
+            )
+        input_power = torch.clamp(noisy_power, min=0.0)
 
-        #optical_field = np.sqrt(input_power) * np.exp(1j * self.phase_noise(input_power))
         amplitude = torch.sqrt(input_power)
-        phase = self.phase_noise(input_power, generator=generator)
-        optical_field = amplitude * torch.exp(self._1j * phase)
+        if torch.is_complex(E):
+            original_phase = torch.angle(E)
+        else:
+            original_phase = torch.where(
+                E < 0,
+                torch.tensor(torch.pi, device=E.device, dtype=E.dtype),
+                torch.zeros_like(E),
+            )
+        phase_jitter = self.phase_noise(input_power, generator=generator)
+        total_phase = original_phase + phase_jitter
+        optical_field = amplitude * torch.exp(self._1j * total_phase)
 
         return optical_field
 
@@ -433,27 +454,36 @@ class Detector(OpticalComponent):
     ):
         if q < 0 or k_b < 0 or temperature < 0:
             raise ValueError("q, k_b, and temperature must be non-negative")
-        # shot_noise_std = np.sqrt(2 * q * photocurrent.mean().item() * self.bandwidth)
-        shot_noise_var = 2 * q * photocurrent.mean() * self.bandwidth
-        # dark_noise_std = np.sqrt(2 * q * self.dark_current * self.bandwidth)
+        pos_current = torch.clamp(photocurrent, min=0.0)
+        shot_noise_var = 2 * q * pos_current * self.bandwidth
         dark_noise_var = 2 * q * self.dark_current * self.bandwidth
-        # thermal_noise_std = np.sqrt(
-        #     4 * k_b * temperature * self.bandwidth / self.impedance
-        # )
         thermal_noise_var = 4 * k_b * temperature * self.bandwidth / self.impedance
 
-        total_noise_var = shot_noise_var + dark_noise_var + thermal_noise_var
+        total_noise_var = shot_noise_var + (dark_noise_var + thermal_noise_var)
         total_noise_std = torch.sqrt(total_noise_var)
 
-        noise = torch.randn(photocurrent.shape, dtype=photocurrent.dtype, device=photocurrent.device, generator=generator)
+        noise = torch.randn(
+            photocurrent.shape,
+            dtype=photocurrent.dtype,
+            device=photocurrent.device,
+            generator=generator,
+        )
         total_noise = noise * total_noise_std
         return total_noise
 
     def simulate(self, power, q, k_b, temperature, generator: Optional[torch.Generator] = None):
-        # detected_power = torch.abs(optical_field) ** 2
+        if not torch.is_complex(power):
+            min_power = torch.min(power).item()
+            if min_power < -1e-6:
+                raise ValueError(
+                    f"Optical power must be non-negative, but got minimum value {min_power:.3e}. "
+                    "Optical power cannot be negative in physical detection."
+                )
+            safe_power = torch.clamp(power, min=0.0)
+        else:
+            safe_power = torch.abs(power)
 
-        photocurrent = self.responsivity * power
-
+        photocurrent = self.responsivity * safe_power
         photocurrent = photocurrent + self.dark_current
 
         photocurrent = photocurrent + self.total_noise(
@@ -482,14 +512,14 @@ class TIA(OpticalComponent):
 class ADC(OpticalComponent):
     """Class for an Analog-to-Digital Converter"""
 
-    def __init__(self, bits: int = 12, v_range: float = 60.0):
+    def __init__(self, bits: int = 12, v_range: float = 2.0):
         super().__init__([], dof=1)
         if not isinstance(bits, int) or bits <= 0:
             raise ValueError("bits must be a positive integer")
         if v_range <= 0:
             raise ValueError("v_range must be positive")
-        self.bits = bits  # 10bits ADC
-        self.v_range = v_range  # 5.0V
+        self.bits = bits
+        self.v_range = v_range
         self.lsb = self.v_range / (2**self.bits)  # least significant bit
 
     def __repr__(self):

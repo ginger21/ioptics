@@ -830,3 +830,70 @@ def test_run_auto_domain_selects_field_for_complex() -> None:
     )
 
     torch.testing.assert_close(out_auto, out_field)
+
+
+def test_complex_model_with_forced_power_domain_safely_executes() -> None:
+    """Complex model output when forced to POWER domain converts safely without ADC clamp crash."""
+    model = _build_small_model()  # FCArray outputs complex tensor
+    inp = _random_input()
+    sim = Simulator()
+
+    # Should not raise NotImplementedError or produce complex voltage in ADC
+    output = sim.run(inp, model, output_domain=OutputDomain.POWER.value, seed=42)
+    assert isinstance(output, torch.Tensor)
+    assert not torch.is_complex(output)
+    assert not torch.any(torch.isnan(output))
+
+
+def test_sequential_with_abssquared_inferred_as_power() -> None:
+    """Sequential model ending with AbsSquared should be inferred as POWER domain in AUTO mode."""
+    from ioptics.nonlinear import AbsSquared
+    model = torch.nn.Sequential(_build_small_model(), AbsSquared())
+    inp = _random_input()
+    sim = Simulator()
+
+    out_auto = sim.run(inp, model, output_domain=OutputDomain.AUTO.value, seed=42)
+    out_power = sim.run(inp, model, output_domain=OutputDomain.POWER.value, seed=42)
+
+    torch.testing.assert_close(out_auto, out_power)
+
+
+def test_simulator_rejects_negative_power_input() -> None:
+    """Simulator should raise ValueError when input_domain=POWER receives negative values."""
+    sim = Simulator()
+    model = _build_small_model()
+    invalid_power_input = torch.tensor([-1.0, 0.5, 1.0, 2.0], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="Input optical power must be non-negative"):
+        sim.run(invalid_power_input, model, input_domain=InputDomain.POWER.value)
+
+
+def test_auto_gain_scales_signal_close_to_adc_range() -> None:
+    """Auto-gain should dynamically scale transimpedance to ~85% of ADC full scale."""
+    sim = Simulator(profile=HardwareProfile.LAB.value)
+    model = _build_small_model()
+    inp = torch.ones(4, dtype=torch.complex64)
+
+    out_default = sim.run(inp, model, seed=42, auto_gain=False)
+    out_autogain = sim.run(inp, model, seed=42, auto_gain=True)
+
+    # In default mode, signal with 100 ohm TIA is small (< 0.5 V)
+    assert out_default.max().item() < 0.5
+    # With auto-gain, peak signal is scaled close to 0.85 * 2.0V = 1.7V (tolerance: 1.5V ~ 1.8V)
+    assert 1.5 <= out_autogain.max().item() <= 1.8
+
+
+def test_digital_normalization_scales_output_to_unit_range() -> None:
+    """Digital normalization should map output values within [0.0, 1.0]."""
+    sim = Simulator(profile=HardwareProfile.LAB.value, auto_gain=True, normalize=True)
+    model = _build_small_model()
+    inp = torch.ones(4, dtype=torch.complex64)
+
+    out = sim.run(inp, model, seed=42)
+    assert torch.all(out >= 0.0)
+    assert torch.all(out <= 1.0)
+    # Peak output under auto-gain should be scaled close to 1.0
+    assert out.max().item() > 0.95
+
+
+
