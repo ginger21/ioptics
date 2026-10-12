@@ -298,8 +298,6 @@ def test_physical_bernoulli_differentiator_raises_when_no_trainable_parameters()
 
 
 def test_physical_bernoulli_differentiator_raises_when_loss_is_not_scalar():
-    # Note: This test verifies the validation logic exists in PhysicalBernoulliDifferentiator.
-    # The simulator may fail before validation on some inputs due to complex type handling.
     model = OpticalNN(ClementsMesh(L=4))
     inputs = torch.randn(2, 4)
     targets = torch.randn(2, 4)
@@ -310,6 +308,34 @@ def test_physical_bernoulli_differentiator_raises_when_loss_is_not_scalar():
     differentiator = PhysicalBernoulliDifferentiator()
     with pytest.raises(ValueError, match="loss_fn must return a scalar tensor"):
         differentiator.differentiate(model, inputs, non_scalar_loss_fn, y_label=targets)
+
+
+def test_differentiators_support_complex_inputs_with_simulator():
+    """Verify that PhysicalBernoulli and ParameterShift fully support complex optical inputs."""
+    from ioptics.simulator import Simulator, HardwareProfile
+
+    model = OpticalNN(ClementsMesh(L=4))
+    inputs = torch.randn(2, 4, dtype=torch.complex64)
+    targets = torch.randn(2, 4, dtype=torch.float32)
+
+    def complex_mse_loss(outputs, targets):
+        mag = outputs.abs() if torch.is_complex(outputs) else outputs
+        return torch.nn.functional.mse_loss(mag, targets)
+
+    sim = Simulator(profile=HardwareProfile.LAB)
+    differentiator_pbd = PhysicalBernoulliDifferentiator(simulator=sim)
+    grads_pbd = differentiator_pbd.differentiate(model, inputs, complex_mse_loss, y_label=targets)
+    assert len(grads_pbd) > 0
+    for grad in grads_pbd:
+        assert grad is not None
+        assert torch.isfinite(grad).all()
+
+    differentiator_ps = ParameterShiftDifferentiator()
+    grads_ps = differentiator_ps.differentiate(model, inputs, complex_mse_loss, y_label=targets)
+    assert len(grads_ps) > 0
+    for grad in grads_ps:
+        assert grad is not None
+        assert torch.isfinite(grad).all()
 
 
 def test_differentiators_reject_nonfinite_loss():

@@ -49,6 +49,45 @@ def test_mzi_matches_expected_formula_zero_phases() -> None:
     torch.testing.assert_close(matrix, expected, atol=1e-6, rtol=0.0)
 
 
+@pytest.mark.parametrize(
+    "theta,phi",
+    [
+        (0.0, 0.0),
+        (0.3, 0.7),
+        (torch.pi / 4, torch.pi / 3),
+        (torch.pi, 2 * torch.pi),
+        (-0.5, 1.2),
+    ],
+)
+def test_mzi_is_unitary_arbitrary_phases(theta: float, phi: float) -> None:
+    """MZI transfer matrix must be unitary: U^H @ U == I."""
+    component = MZI(m=0, n=1, theta=theta, phi=phi)
+    u = component.get_transfer_matrix()
+    identity = u.conj().T @ u
+
+    torch.testing.assert_close(
+        identity,
+        torch.eye(2, dtype=torch.complex64),
+        atol=1e-6,
+        rtol=0.0,
+    )
+
+
+def test_mzi_energy_conservation() -> None:
+    """Lossless MZI must conserve optical power for arbitrary complex inputs."""
+    torch.manual_seed(42)
+    component = MZI(m=0, n=1, theta=0.42, phi=1.23)
+    u = component.get_transfer_matrix()
+
+    input_fields = torch.randn(5, 2, dtype=torch.complex64)
+    output_fields = input_fields @ u.T
+
+    input_power = (input_fields.abs() ** 2).sum(dim=-1)
+    output_power = (output_fields.abs() ** 2).sum(dim=-1)
+
+    torch.testing.assert_close(input_power, output_power, atol=1e-6, rtol=1e-6)
+
+
 def test_waveguide_identity() -> None:
     component = WaveGuide(m=0)
 

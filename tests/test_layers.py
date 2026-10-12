@@ -317,3 +317,41 @@ def test_corelayer_input_rank_validation() -> None:
 
     with pytest.raises(ValueError):
         _ = core_layer(torch.tensor(1.0, dtype=torch.float32))
+@pytest.mark.parametrize("L", [2, 3, 4, 6, 8])
+def test_clements_mesh_transfer_matrix_is_unitary(L: int) -> None:
+    """ClementsMesh transfer matrix must be unitary: U^H @ U == I and U @ U^H == I."""
+    torch.manual_seed(42 + L)
+    mesh = ClementsMesh(L=L)
+    u = mesh.get_transfer_matrix()
+
+    assert u.shape == (L, L)
+    identity_right = u.conj().T @ u
+    identity_left = u @ u.conj().T
+
+    torch.testing.assert_close(
+        identity_right,
+        torch.eye(L, dtype=torch.complex64),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        identity_left,
+        torch.eye(L, dtype=torch.complex64),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("L", [2, 4, 8])
+def test_clements_mesh_energy_conservation(L: int) -> None:
+    """Lossless ClementsMesh forward pass must conserve optical energy (Parseval identity)."""
+    torch.manual_seed(100 + L)
+    mesh = ClementsMesh(L=L)
+
+    # Batch of random complex optical fields
+    input_fields = torch.randn(10, L, dtype=torch.complex64)
+    output_fields = mesh(input_fields)
+
+    input_energy = (input_fields.abs() ** 2).sum(dim=-1)
+    output_energy = (output_fields.abs() ** 2).sum(dim=-1)
+

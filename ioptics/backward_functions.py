@@ -58,9 +58,9 @@ class ParameterShiftStrategy(BackwardStrategy):
 
         with torch.no_grad():
             for param in params:
-                origin_value = param.clone()
+                origin_value = param.data.clone()
                 try:
-                    param.copy_(origin_value + torch.pi / 2)
+                    param.data.copy_(origin_value + torch.pi / 2)
                     output_plus = optical_layer(input_tensor)
 
                     df_dtheta = (output_plus - output_tensor) * (1 - 1j) / 2
@@ -70,7 +70,7 @@ class ParameterShiftStrategy(BackwardStrategy):
                         grad_theta.to(device=param.device, dtype=param.dtype).reshape_as(param)
                     )
                 finally:
-                    param.copy_(origin_value)
+                    param.data.copy_(origin_value)
 
         return grad_input, *grad_list
 
