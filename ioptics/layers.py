@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 from enum import Enum
 from typing import List, Iterable, cast, Optional, Union
-from .components import OpticalComponent, MZI, MZM
+from .components import OpticalComponent, MZI, MZM, PhaseShifter
 from functools import reduce
 from .backward_functions import BackwardType, CustomForwardFunction
 
@@ -119,11 +119,54 @@ class ArrayColumn(ColumnLayer):
     """
     def __init__(self, N:int, components:List[OpticalComponent]):
         super().__init__(N, components)
+        self._all_mzm = len(self.components) > 0 and all(isinstance(c, MZM) for c in self.components)
+        self._all_ps = len(self.components) > 0 and all(isinstance(c, PhaseShifter) for c in self.components)
+        if self._all_mzm or self._all_ps:
+            m_list = [c.m for c in self.components]
+            self._is_contiguous_full = (
+                len(m_list) == N and m_list == list(range(N))
+            )
+            self.register_buffer("_comp_m_idx", torch.tensor(m_list, dtype=torch.long), persistent=False)
+        else:
+            self._is_contiguous_full = False
+            self._comp_m_idx = None
 
     def get_transfer_matrix(self) -> torch.Tensor:
         # Returns a 1D tensor of shape (N,) representing one row of the weight matrix
         if len(self.components) == 0:
             return torch.zeros(self.N, dtype=torch.complex64)
+
+        if self._all_mzm:
+            thetas = [
+                (c.theta + c.phase_noise_theta.to(c.theta.device, c.theta.dtype)).view(1)
+                if (not self.training or c.noise_aware_training)
+                else c.theta.view(1)
+                for c in self.components
+            ]
+            theta_vec = torch.cat(thetas)
+            _1j = self.components[0]._1j
+            vals = 0.5 * (torch.exp(_1j * theta_vec) + 1.0)
+            if self._is_contiguous_full:
+                return vals
+            T = torch.zeros(self.N, dtype=vals.dtype, device=vals.device)
+            T[self._comp_m_idx.to(device=T.device)] = vals
+            return T
+
+        if self._all_ps:
+            phis = [
+                (c.phi + c.phase_noise_phi.to(c.phi.device, c.phi.dtype)).view(1)
+                if (not self.training or c.noise_aware_training)
+                else c.phi.view(1)
+                for c in self.components
+            ]
+            phi_vec = torch.cat(phis)
+            _1j = self.components[0]._1j
+            vals = torch.exp(_1j * phi_vec)
+            if self._is_contiguous_full:
+                return vals
+            T = torch.zeros(self.N, dtype=vals.dtype, device=vals.device)
+            T[self._comp_m_idx.to(device=T.device)] = vals
+            return T
 
         first_T = self.components[0].get_transfer_matrix()
         transfer_matrix = torch.zeros(
@@ -352,22 +395,26 @@ class ArrayCore(CoreLayer):
         if len(self.columnlayers) == 0:
             raise ValueError("columnlayers cannot be empty")
 
-        # self.L = cast(int, self.L)
-        # n = self.columnlayers[0].N
-        # n = cast(int, n)
+        if all(
+            getattr(col, "_all_mzm", False) and getattr(col, "_is_contiguous_full", False)
+            for col in self.columnlayers
+        ):
+            thetas = [
+                (c.theta + c.phase_noise_theta.to(c.theta.device, c.theta.dtype)).view(1)
+                if (not col.training or c.noise_aware_training)
+                else c.theta.view(1)
+                for col in self.columnlayers
+                for c in col.components
+            ]
+            theta_mat = torch.cat(thetas).view(self.L, self.columnlayers[0].N)
+            _1j = self.columnlayers[0].components[0]._1j
+            return 0.5 * (torch.exp(_1j * theta_mat) + 1.0)
+
         first_T = self.columnlayers[0].get_transfer_matrix()
-        # Weight matrix shape: (L rows x N cols). Each columnlayer produces one row.
-        transfer_matrix = torch.zeros(
-            (self.L, self.columnlayers[0].N),
-            dtype=first_T.dtype,
-            device=first_T.device,
-        )
-        for inx, layer in enumerate(self.columnlayers):
-            # layer = cast(ColumnLayer, layer)
-            T = first_T if inx == 0 else layer.get_transfer_matrix()
-            T = T.to(device=transfer_matrix.device, dtype=transfer_matrix.dtype)
-            transfer_matrix[inx] = T
-        return transfer_matrix
+        rows = [first_T]
+        for layer in self.columnlayers[1:]:
+            rows.append(layer.get_transfer_matrix().to(device=first_T.device, dtype=first_T.dtype))
+        return torch.stack(rows, dim=0)
 
 class FCArray(ArrayCore):
     """Fully-connected optical array: maps in_dim inputs to out_dim outputs.

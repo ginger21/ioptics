@@ -82,6 +82,25 @@ def test_arraycolumn_returns_1d_row():
     assert transfer_matrix.dtype == torch.complex64
 
 
+def test_arraycolumn_sparse_and_phaseshifter_vectorization() -> None:
+    """Verify vectorized ArrayColumn on sparse MZM ports and PhaseShifter components."""
+    mzm0 = MZM(0, theta=0.4)
+    mzm2 = MZM(2, theta=1.2)
+    sparse_mzm_col = ArrayColumn(N=4, components=[mzm0, mzm2])
+    tm_mzm = sparse_mzm_col.get_transfer_matrix()
+    expected_mzm = torch.zeros(4, dtype=torch.complex64)
+    expected_mzm[0] = mzm0.get_transfer_matrix()
+    expected_mzm[2] = mzm2.get_transfer_matrix()
+    torch.testing.assert_close(tm_mzm, expected_mzm, atol=1e-6, rtol=1e-6)
+
+    ps0 = PhaseShifter(0, phi=0.5)
+    ps1 = PhaseShifter(1, phi=-0.7)
+    ps_col = ArrayColumn(N=2, components=[ps0, ps1])
+    tm_ps = ps_col.get_transfer_matrix()
+    expected_ps = torch.stack([ps0.get_transfer_matrix(), ps1.get_transfer_matrix()])
+    torch.testing.assert_close(tm_ps, expected_ps, atol=1e-6, rtol=1e-6)
+
+
 def test_meshcore_single_column_matches_column():
     """Test that MeshCore(L=2, [MeshColumn(2,[MZI(0,1,theta=0.0,phi=0.0)])]) transfer matrix == MeshColumn's transfer matrix"""
     mzi = MZI(0, 1, theta=0.0, phi=0.0)
@@ -396,3 +415,26 @@ def test_clements_mesh_field_prop_matches_matrix_mode(L: int) -> None:
             torch.testing.assert_close(p2.grad, p1.grad, atol=1e-5, rtol=1e-5)
     finally:
         torch.set_rng_state(rng_state)
+
+
+def test_clements_mesh_and_fcarray_torch_compile_compatibility() -> None:
+    """Verify functional scatter implementation compiles cleanly under torch.compile."""
+    torch.manual_seed(42)
+    mesh = ClementsMesh(L=4)
+    fc = FCArray(in_dim=4, out_dim=3)
+    x = torch.randn(4, 4, dtype=torch.complex64, requires_grad=True)
+    x_comp = x.detach().clone().requires_grad_(True)
+
+    out_eager = fc(mesh(x))
+    (out_eager.abs() ** 2).sum().backward()
+
+    compiled_fn = torch.compile(lambda inp: fc(mesh(inp)), backend="aot_eager")
+    for p in list(mesh.parameters()) + list(fc.parameters()):
+        p.grad = None
+
+    out_comp = compiled_fn(x_comp)
+    (out_comp.abs() ** 2).sum().backward()
+
+    torch.testing.assert_close(out_comp, out_eager, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(x_comp.grad, x.grad, atol=1e-5, rtol=1e-5)
+\n

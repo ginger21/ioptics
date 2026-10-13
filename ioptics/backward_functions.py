@@ -102,30 +102,30 @@ class AdjointStrategy(BackwardStrategy):
         )
         internal_dtype = torch.complex128 if use_complex128 else torch.complex64
 
-        _1j = torch.tensor(1j, dtype=internal_dtype)
-
         with torch.no_grad():
             device = input_tensor.device
 
-            # 只在需要时进行类型转换，保持与输入一致的精度
-            if input_tensor.dtype != internal_dtype and not torch.is_complex(input_tensor):
-                input_tensor = input_tensor.to(internal_dtype)
-            elif torch.is_complex(input_tensor) and input_tensor.dtype != internal_dtype:
+            if input_tensor.dtype != internal_dtype:
                 input_tensor = input_tensor.to(internal_dtype)
 
             if grad_output.dtype != internal_dtype:
                 grad_output = grad_output.to(internal_dtype)
 
             L = optical_layer.L
+            is_array_core = hasattr(optical_layer, "columnlayers") and len(optical_layer.columnlayers) > 0 and optical_layer.columnlayers[0].__class__.__name__ == "ArrayColumn"
 
             # === 正向传播：逐层记录每个 column 输入端的光场 ===
             forward_fields = []
             current_field = input_tensor
 
-            for column in optical_layer.columnlayers:
-                forward_fields.append(current_field)
-                T_col = column.get_transfer_matrix().to(device, dtype=internal_dtype)
-                current_field = F.linear(current_field, T_col)
+            if is_array_core:
+                for _ in optical_layer.columnlayers:
+                    forward_fields.append(input_tensor)
+            else:
+                for column in optical_layer.columnlayers:
+                    forward_fields.append(current_field)
+                    T_col = column.get_transfer_matrix().to(device, dtype=internal_dtype)
+                    current_field = F.linear(current_field, T_col)
 
             # === 初始化伴随场：将 grad_output 扩展到完整维度 ===
             full_grad = torch.zeros(
@@ -139,131 +139,237 @@ class AdjointStrategy(BackwardStrategy):
             all_grads = []
             param_grad_map: Dict[int, torch.Tensor] = {}
 
-            for i in reversed(range(len(optical_layer.columnlayers))):
-                column = optical_layer.columnlayers[i]
-                A_fwd = forward_fields[i]
+            is_full_mzm_array = is_array_core and all(
+                getattr(col, "_all_mzm", False) and getattr(col, "_is_contiguous_full", False)
+                for col in optical_layer.columnlayers
+            )
 
-                layer_grads = []
+            if is_full_mzm_array:
+                N = optical_layer.columnlayers[0].N
+                thetas = [
+                    ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                    for col in optical_layer.columnlayers
+                    for c in col.components
+                ]
+                theta_mat = torch.cat(thetas).view(L, N)
+                dT_dtheta = (0.5j * torch.exp(1j * theta_mat)).to(dtype=internal_dtype)
 
-                is_pure_mzi = len(column.components) > 0 and all(isinstance(c, MZI) for c in column.components)
-                if is_pure_mzi:
-                    m_idx = getattr(column, "_mzi_m_idx", None)
-                    n_idx = getattr(column, "_mzi_n_idx", None)
-                    if m_idx is None or n_idx is None:
-                        m_idx = [c.m for c in column.components]
-                        n_idx = [c.n for c in column.components]
+                x_flat = input_tensor.reshape(-1, N)
+                adj_flat = adjoint_field.reshape(-1, L)
+                grad_theta_mat = ((adj_flat.conj().T @ x_flat) * dT_dtheta).real
+
+                for i, col in enumerate(optical_layer.columnlayers):
+                    row_grads = grad_theta_mat[i]
+                    for m, c in enumerate(col.components):
+                        gt = row_grads[m]
+                        if gt.device != c.theta.device or gt.dtype != c.theta.dtype:
+                            gt = gt.to(device=c.theta.device, dtype=c.theta.dtype)
+                        gt = gt.reshape_as(c.theta)
+                        param_grad_map[id(c.theta)] = gt
+                        all_grads.append(gt)
+            else:
+                for i in reversed(range(len(optical_layer.columnlayers))):
+                    column = optical_layer.columnlayers[i]
+                    A_fwd = forward_fields[i]
+
+                    layer_grads = []
+
+                    is_pure_mzi = len(column.components) > 0 and all(isinstance(c, MZI) for c in column.components)
+                    is_pure_mzm = len(column.components) > 0 and all(isinstance(c, MZM) for c in column.components)
+                    is_pure_ps = len(column.components) > 0 and all(isinstance(c, PhaseShifter) for c in column.components)
+
+                    if is_pure_mzi:
+                        m_idx = getattr(column, "_mzi_m_idx", None)
+                        n_idx = getattr(column, "_mzi_n_idx", None)
+                        if m_idx is None or n_idx is None:
+                            m_idx = [c.m for c in column.components]
+                            n_idx = [c.n for c in column.components]
+                        else:
+                            if m_idx.device != device:
+                                m_idx = m_idx.to(device)
+                            if n_idx.device != device:
+                                n_idx = n_idx.to(device)
+
+                        thetas = torch.cat([
+                            ((c.theta + c.phase_noise_theta) if (not column.training or c.noise_aware_training) else c.theta).view(1)
+                            for c in column.components
+                        ])
+                        phis = torch.cat([
+                            ((c.phi + c.phase_noise_phi) if (not column.training or c.noise_aware_training) else c.phi).view(1)
+                            for c in column.components
+                        ])
+
+                        a_m = A_fwd[..., m_idx]
+                        a_n = A_fwd[..., n_idx]
+                        adj_m = adjoint_field[..., m_idx]
+                        adj_n = adjoint_field[..., n_idx]
+
+                        e_itheta = torch.exp(1j * thetas).to(dtype=internal_dtype)
+                        e_iphi = torch.exp(1j * phis).to(dtype=internal_dtype)
+                        e_i_pt = e_iphi * e_itheta
+
+                        out0_theta = 0.5 * e_i_pt * (1j * a_m - a_n)
+                        out1_theta = -0.5 * e_itheta * (a_m + 1j * a_n)
+                        term_theta = adj_m.conj() * out0_theta + adj_n.conj() * out1_theta
+
+                        if term_theta.ndim > 1:
+                            grad_theta_vec = term_theta.sum(dim=tuple(range(term_theta.ndim - 1))).real
+                        else:
+                            grad_theta_vec = term_theta.real
+
+                        out0_phi = 0.5j * e_iphi * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
+                        term_phi = adj_m.conj() * out0_phi
+
+                        if term_phi.ndim > 1:
+                            grad_phi_vec = term_phi.sum(dim=tuple(range(term_phi.ndim - 1))).real
+                        else:
+                            grad_phi_vec = term_phi.real
+
+                        for k, component in enumerate(column.components):
+                            gt = grad_theta_vec[k]
+                            if gt.device != component.theta.device or gt.dtype != component.theta.dtype:
+                                gt = gt.to(device=component.theta.device, dtype=component.theta.dtype)
+                            gt = gt.reshape_as(component.theta)
+
+                            gp = grad_phi_vec[k]
+                            if gp.device != component.phi.device or gp.dtype != component.phi.dtype:
+                                gp = gp.to(device=component.phi.device, dtype=component.phi.dtype)
+                            gp = gp.reshape_as(component.phi)
+
+                            param_grad_map[id(component.theta)] = gt
+                            param_grad_map[id(component.phi)] = gp
+                            layer_grads.extend([gt, gp])
+
+                    elif is_pure_mzm:
+                        m_idx = getattr(column, "_comp_m_idx", None)
+                        if m_idx is None:
+                            m_idx = [c.m for c in column.components]
+                        elif m_idx.device != device:
+                            m_idx = m_idx.to(device)
+
+                        thetas = torch.cat([
+                            ((c.theta + c.phase_noise_theta) if (not column.training or c.noise_aware_training) else c.theta).view(1)
+                            for c in column.components
+                        ])
+                        a_m = A_fwd[..., m_idx]
+                        adj_m = adjoint_field[..., i].unsqueeze(-1) if is_array_core else adjoint_field[..., m_idx]
+
+                        dT_dtheta = (0.5j * torch.exp(1j * thetas)).to(dtype=internal_dtype)
+                        term_theta = adj_m.conj() * dT_dtheta * a_m
+
+                        if term_theta.ndim > 1:
+                            grad_theta_vec = term_theta.sum(dim=tuple(range(term_theta.ndim - 1))).real
+                        else:
+                            grad_theta_vec = term_theta.real
+
+                        for k, component in enumerate(column.components):
+                            gt = grad_theta_vec[k]
+                            if gt.device != component.theta.device or gt.dtype != component.theta.dtype:
+                                gt = gt.to(device=component.theta.device, dtype=component.theta.dtype)
+                            gt = gt.reshape_as(component.theta)
+                            param_grad_map[id(component.theta)] = gt
+                            layer_grads.append(gt)
+
+                    elif is_pure_ps:
+                        m_idx = getattr(column, "_comp_m_idx", None)
+                        if m_idx is None:
+                            m_idx = [c.m for c in column.components]
+                        elif m_idx.device != device:
+                            m_idx = m_idx.to(device)
+
+                        phis = torch.cat([
+                            ((c.phi + c.phase_noise_phi) if (not column.training or c.noise_aware_training) else c.phi).view(1)
+                            for c in column.components
+                        ])
+                        a_m = A_fwd[..., m_idx]
+                        adj_m = adjoint_field[..., i].unsqueeze(-1) if is_array_core else adjoint_field[..., m_idx]
+
+                        dT_dphi = (1j * torch.exp(1j * phis)).to(dtype=internal_dtype)
+                        term_phi = adj_m.conj() * dT_dphi * a_m
+
+                        if term_phi.ndim > 1:
+                            grad_phi_vec = term_phi.sum(dim=tuple(range(term_phi.ndim - 1))).real
+                        else:
+                            grad_phi_vec = term_phi.real
+
+                        for k, component in enumerate(column.components):
+                            gp = grad_phi_vec[k]
+                            if gp.device != component.phi.device or gp.dtype != component.phi.dtype:
+                                gp = gp.to(device=component.phi.device, dtype=component.phi.dtype)
+                            gp = gp.reshape_as(component.phi)
+                            param_grad_map[id(component.phi)] = gp
+                            layer_grads.append(gp)
+
                     else:
-                        m_idx = m_idx.to(device)
-                        n_idx = n_idx.to(device)
+                        for component in column.components:
+                            c_apply_noise = not column.training or component.noise_aware_training
+                            if isinstance(component, MZI):
+                                m, n = component.m, component.n
+                                theta = (component.theta + component.phase_noise_theta) if c_apply_noise else component.theta
+                                phi = (component.phi + component.phase_noise_phi) if c_apply_noise else component.phi
 
-                    thetas = torch.cat([(c.theta + c.phase_noise_theta).view(1).to(internal_dtype) for c in column.components])
-                    phis = torch.cat([(c.phi + c.phase_noise_phi).view(1).to(internal_dtype) for c in column.components])
+                                a_m = A_fwd[..., m]
+                                a_n = A_fwd[..., n]
+                                adj_m = adjoint_field[..., m]
+                                adj_n = adjoint_field[..., n]
 
-                    a_m = A_fwd[..., m_idx]
-                    a_n = A_fwd[..., n_idx]
-                    adj_m = adjoint_field[..., m_idx]
-                    adj_n = adjoint_field[..., n_idx]
+                                e_itheta = torch.exp(1j * theta).to(dtype=internal_dtype)
+                                e_iphi = torch.exp(1j * phi).to(dtype=internal_dtype)
+                                e_i_pt = e_iphi * e_itheta
 
-                    e_itheta = torch.exp(_1j * thetas)
-                    e_iphi = torch.exp(_1j * phis)
-                    e_i_pt = e_iphi * e_itheta
+                                out0_theta = 0.5 * e_i_pt * (1j * a_m - a_n)
+                                out1_theta = -0.5 * e_itheta * (a_m + 1j * a_n)
+                                grad_theta = _sum_all_dims(adj_m.conj() * out0_theta + adj_n.conj() * out1_theta).real
 
-                    out0_theta = 0.5 * e_i_pt * (_1j * a_m - a_n)
-                    out1_theta = -0.5 * e_itheta * (a_m + _1j * a_n)
-                    term_theta = adj_m.conj() * out0_theta + adj_n.conj() * out1_theta
+                                out0_phi = 0.5j * e_iphi * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
+                                grad_phi = _sum_all_dims(adj_m.conj() * out0_phi).real
 
-                    if term_theta.ndim > 1:
-                        grad_theta_vec = term_theta.sum(dim=tuple(range(term_theta.ndim - 1))).real
-                    else:
-                        grad_theta_vec = term_theta.real
+                                grad_theta_param = grad_theta.to(device=component.theta.device, dtype=component.theta.dtype).reshape_as(component.theta)
+                                grad_phi_param = grad_phi.to(device=component.phi.device, dtype=component.phi.dtype).reshape_as(component.phi)
+                                param_grad_map[id(component.theta)] = grad_theta_param
+                                param_grad_map[id(component.phi)] = grad_phi_param
+                                layer_grads.extend([grad_theta_param, grad_phi_param])
 
-                    out0_phi = 0.5 * _1j * e_iphi * ((e_itheta - 1.0) * a_m + _1j * (1.0 + e_itheta) * a_n)
-                    term_phi = adj_m.conj() * out0_phi
+                            elif isinstance(component, PhaseShifter):
+                                m = component.m
+                                phi = (component.phi + component.phase_noise_phi) if c_apply_noise else component.phi
 
-                    if term_phi.ndim > 1:
-                        grad_phi_vec = term_phi.sum(dim=tuple(range(term_phi.ndim - 1))).real
-                    else:
-                        grad_phi_vec = term_phi.real
+                                a_m = A_fwd[..., m]
+                                adj_m = adjoint_field[..., i] if is_array_core else adjoint_field[..., m]
 
-                    for k, component in enumerate(column.components):
-                        gt = grad_theta_vec[k].to(device=component.theta.device, dtype=component.theta.dtype).reshape_as(component.theta)
-                        gp = grad_phi_vec[k].to(device=component.phi.device, dtype=component.phi.dtype).reshape_as(component.phi)
-                        param_grad_map[id(component.theta)] = gt
-                        param_grad_map[id(component.phi)] = gp
-                        layer_grads.extend([gt, gp])
-                else:
-                    for component in column.components:
-                        if isinstance(component, MZI):
-                            m, n = component.m, component.n
-                            theta = (component.theta + component.phase_noise_theta).to(internal_dtype)
-                            phi = (component.phi + component.phase_noise_phi).to(internal_dtype)
+                                grad_phi = _sum_all_dims(adj_m.conj() * (1j * torch.exp(1j * phi)).to(dtype=internal_dtype) * a_m).real
+                                grad_phi_param = grad_phi.to(device=component.phi.device, dtype=component.phi.dtype).reshape_as(component.phi)
+                                param_grad_map[id(component.phi)] = grad_phi_param
+                                layer_grads.append(grad_phi_param)
 
-                            a = torch.stack([A_fwd[..., m], A_fwd[..., n]], dim=-1)
-                            adj = torch.stack([adjoint_field[..., m], adjoint_field[..., n]], dim=-1)
+                            elif isinstance(component, MZM):
+                                m = component.m
+                                theta = (component.theta + component.phase_noise_theta) if c_apply_noise else component.theta
 
-                            e_itheta = torch.exp(_1j * theta)
-                            e_iphi = torch.exp(_1j * phi)
-                            e_i_pt = e_iphi * e_itheta
+                                a_m = A_fwd[..., m]
+                                adj_m = adjoint_field[..., i] if is_array_core else adjoint_field[..., m]
 
-                            # ∂T/∂θ
-                            dT_dtheta = torch.zeros(2, 2, dtype=internal_dtype, device=device)
-                            dT_dtheta[0, 0] = 0.5 * _1j * e_i_pt
-                            dT_dtheta[0, 1] = -0.5 * e_i_pt
-                            dT_dtheta[1, 0] = -0.5 * e_itheta
-                            dT_dtheta[1, 1] = -0.5 * _1j * e_itheta
+                                dT_dtheta = (0.5j * torch.exp(1j * theta)).to(dtype=internal_dtype)
+                                grad_theta = _sum_all_dims(adj_m.conj() * dT_dtheta * a_m).real
+                                grad_theta_param = grad_theta.to(device=component.theta.device, dtype=component.theta.dtype).reshape_as(component.theta)
+                                param_grad_map[id(component.theta)] = grad_theta_param
+                                layer_grads.append(grad_theta_param)
 
-                            # ∂T/∂φ
-                            T_comp = component.get_transfer_matrix().to(device, dtype=internal_dtype)
-                            dT_dphi = torch.zeros(2, 2, dtype=internal_dtype, device=device)
-                            dT_dphi[0, 0] = _1j * T_comp[0, 0]
-                            dT_dphi[0, 1] = _1j * T_comp[0, 1]
+                    all_grads = layer_grads + all_grads
 
-                            # grad = Re(adj^H · ∂T/∂param · a)
-                            grad_theta = _sum_all_dims(adj.conj() * F.linear(a, dT_dtheta)).real
-                            grad_phi = _sum_all_dims(adj.conj() * F.linear(a, dT_dphi)).real
-
-                            grad_theta_param = grad_theta.reshape_as(component.theta)
-                            grad_phi_param = grad_phi.reshape_as(component.phi)
-                            param_grad_map[id(component.theta)] = grad_theta_param
-                            param_grad_map[id(component.phi)] = grad_phi_param
-                            layer_grads.extend([grad_theta_param, grad_phi_param])
-
-                        elif isinstance(component, PhaseShifter):
-                            m = component.m
-                            phi = (component.phi + component.phase_noise_phi).to(internal_dtype)
-
-                            a_m = A_fwd[..., m]
-                            adj_m = adjoint_field[..., m]
-
-                            grad_phi = _sum_all_dims(adj_m.conj() * _1j * torch.exp(_1j * phi) * a_m).real
-                            grad_phi_param = grad_phi.reshape_as(component.phi)
-                            param_grad_map[id(component.phi)] = grad_phi_param
-                            layer_grads.append(grad_phi_param)
-
-                        elif isinstance(component, MZM):
-                            m = component.m
-                            theta = (component.theta + component.phase_noise_theta).to(internal_dtype)
-
-                            a_m = A_fwd[..., m]
-                            adj_m = adjoint_field[..., m]
-
-                            dT_dtheta = 0.5 * _1j * torch.exp(_1j * theta)
-                            grad_theta = _sum_all_dims(adj_m.conj() * dT_dtheta * a_m).real
-                            grad_theta_param = grad_theta.reshape_as(component.theta)
-                            param_grad_map[id(component.theta)] = grad_theta_param
-                            layer_grads.append(grad_theta_param)
-
-                all_grads = layer_grads + all_grads
-
-                # 反向传播伴随场: A* = T^H · A*
-                T_col = column.get_transfer_matrix().to(device, dtype=internal_dtype)
-                adjoint_field = F.linear(adjoint_field, T_col.conj().T)
+                    if not is_array_core:
+                        # 反向传播伴随场: A* = T^H · A*
+                        T_col = column.get_transfer_matrix().to(device, dtype=internal_dtype)
+                        adjoint_field = F.linear(adjoint_field, T_col.conj().T)
 
             if saved_forward_transfer_matrix is not None:
                 grad_transfer_matrix = saved_forward_transfer_matrix[
                     optical_layer.output_ports, :
                 ].to(device=device, dtype=internal_dtype)
                 grad_input = F.linear(grad_output, grad_transfer_matrix.conj().T)
+            elif is_array_core:
+                T_total = optical_layer.get_transfer_matrix().to(device=device, dtype=internal_dtype)
+                grad_input = F.linear(adjoint_field, T_total.conj().T)
             else:
                 grad_input = adjoint_field
 

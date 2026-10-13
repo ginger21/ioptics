@@ -110,6 +110,22 @@ def test_mzm_half_scale_at_zero_phase() -> None:
     torch.testing.assert_close(matrix, expected, atol=1e-6, rtol=0.0)
 
 
+@pytest.mark.parametrize("theta", [0.0, 0.3, torch.pi / 2, torch.pi, -1.1])
+def test_mzm_closed_form_matches_mmi_ps_mmi_chain(theta: float) -> None:
+    """MZM closed-form transfer coefficient must match MMI21 @ PS @ MMI12 exactly."""
+    component = MZM(m=0, theta=theta)
+    actual = component.get_transfer_matrix()
+
+    ps = torch.eye(2, dtype=torch.complex64)
+    ps[0, 0] = torch.exp(1j * torch.tensor(theta, dtype=torch.complex64))
+    s = 1.0 / (2.0 ** 0.5)
+    mmi12 = torch.tensor([[s], [s]], dtype=torch.complex64)
+    mmi21 = torch.tensor([s, s], dtype=torch.complex64)
+    expected = (mmi21 @ ps @ mmi12).squeeze()
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_laser_simulate_zero_input_stays_zero() -> None:
     torch.manual_seed(0)
     component = Laser(RIN=-155, linewidth=1e5)

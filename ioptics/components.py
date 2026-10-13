@@ -321,26 +321,7 @@ class MZM(OpticalComponent):
         else:
             theta = self.theta
 
-        transfer_matrix_PS = torch.eye(2, dtype=torch.complex64, device=self._1j.device)
-        transfer_matrix_PS[0][0] = torch.exp(self._1j * theta)
-
-        _sqrt2_half = (torch.sqrt(torch.tensor(2.0, dtype=torch.float32)) / 2).item()
-        transfer_matrix_MMI12 = torch.tensor(
-            [[_sqrt2_half], [_sqrt2_half]],
-            dtype=torch.complex64,
-            device=self._1j.device,
-        )
-        transfer_matrix_MMI21 = torch.tensor(
-            [_sqrt2_half, _sqrt2_half],
-            dtype=torch.complex64,
-            device=self._1j.device,
-        )
-
-        transfer_matrix = (
-            transfer_matrix_MMI21 @ transfer_matrix_PS @ transfer_matrix_MMI12
-        )
-
-        return transfer_matrix.squeeze()
+        return (0.5 * (torch.exp(self._1j * theta) + 1.0)).squeeze()
 
 
 class Laser(OpticalComponent):

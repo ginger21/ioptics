@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from ioptics.backward_functions import BackwardType, CustomForwardFunction
-from ioptics.layers import ClementsMesh
+from ioptics.layers import ClementsMesh, FCArray
 
 
 def test_custom_forward_dtype_behavior_float64_to_complex128() -> None:
@@ -290,3 +290,36 @@ def test_custom_forward_parameter_grad_order_matches_forward_arg_order(
     for baseline_grad, param in zip(baseline_grads, params):
         assert param.grad is not None
         torch.testing.assert_close(param.grad, baseline_grad, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "backward_type",
+    [BackwardType.PARAMETER_SHIFT.value, BackwardType.ADJOINT_VARIANT.value],
+)
+def test_fcarray_custom_backward_matches_autograd(backward_type: str) -> None:
+    """Verify FCArray with AdjointVariant and ParameterShift matches Autograd gradients."""
+    torch.manual_seed(123)
+    in_dim, out_dim = 5, 3
+    layer_custom = FCArray(in_dim=in_dim, out_dim=out_dim, backward_type=backward_type)
+    layer_default = FCArray(in_dim=in_dim, out_dim=out_dim, backward_type=BackwardType.DEFAULT.value)
+
+    with torch.no_grad():
+        for p_def, p_cust in zip(layer_default.parameters(), layer_custom.parameters()):
+            p_def.copy_(p_cust)
+
+    x = torch.randn(4, in_dim, dtype=torch.complex64)
+    x_cust = x.clone().requires_grad_(True)
+    x_def = x.clone().requires_grad_(True)
+
+    out_cust = layer_custom(x_cust)
+    out_def = layer_default(x_def)
+    torch.testing.assert_close(out_cust, out_def, atol=1e-5, rtol=1e-5)
+
+    (out_cust.abs() ** 2).sum().backward()
+    (out_def.abs() ** 2).sum().backward()
+
+    torch.testing.assert_close(x_cust.grad, x_def.grad, atol=1e-4, rtol=1e-3)
+    for p_cust, p_def in zip(layer_custom.parameters(), layer_default.parameters()):
+        assert p_cust.grad is not None and p_def.grad is not None
+        torch.testing.assert_close(p_cust.grad, p_def.grad, atol=1e-4, rtol=1e-3)
+
