@@ -2,10 +2,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from enum import Enum
-from typing import List, Iterable, cast, Optional, Union
-from .components import OpticalComponent, MZI, MZM, PhaseShifter
+from typing import List, Iterable, cast, Optional, Union, Tuple
+from .components import OpticalComponent, MZI, MZM, PhaseShifter, get_global_param_epoch
 from functools import reduce
 from .backward_functions import BackwardType, CustomForwardFunction
+
+
+_get_tensor_version = torch.Tensor._version.__get__
+_get_tensor_item = torch.Tensor.item
 
 
 class ForwardMode(Enum):
@@ -21,7 +25,77 @@ class ColumnLayer(torch.nn.Module):
                 if port < 0 or port >= N:
                     raise ValueError(f"Port index {port} out of range [0, {N})")
         self.components = torch.nn.ModuleList(components)
-        
+        self.cache_enabled: bool = True
+        self._col_params: Optional[Tuple[torch.Tensor, ...]] = None
+        self._col_any_requires_grad: bool = False
+        self._cached_col_tm: Optional[torch.Tensor] = None
+        self._cached_col_sig: Optional[tuple] = None
+        self._cached_col_has_grad: bool = False
+        self._cached_col_epoch: int = -1
+        self._base_col_tm: Optional[torch.Tensor] = None
+        self._base_col_sig: Optional[tuple] = None
+        self._base_col_has_grad: bool = False
+
+    def _init_col_cache_tracking(self) -> None:
+        params = tuple(self.parameters())
+        self._col_params = params
+        self._col_any_requires_grad = any(p.requires_grad for p in params)
+
+    def _get_col_signature(self) -> tuple:
+        if self._col_params is None:
+            self._init_col_cache_tracking()
+        params = self._col_params
+        if not params:
+            return (self.training,)
+        p0 = params[0]
+        if p0.is_cpu:
+            return (
+                self.training,
+                p0.data_ptr(),
+                params[-1].data_ptr(),
+                tuple(map(_get_tensor_item, params)),
+            )
+        return (
+            self.training,
+            p0.data_ptr(),
+            params[-1].data_ptr(),
+            tuple(map(_get_tensor_version, params)),
+        )
+
+    def pin_base_cache(self) -> None:
+        self._base_col_tm = self._cached_col_tm
+        self._base_col_sig = self._cached_col_sig
+        self._base_col_has_grad = self._cached_col_has_grad
+
+    def _on_col_tm_backward(self, _grad: torch.Tensor) -> None:
+        self._cached_col_tm = None
+        self._cached_col_sig = None
+        self._cached_col_has_grad = False
+        self._cached_col_epoch = -1
+        self._base_col_tm = None
+        self._base_col_sig = None
+        self._base_col_has_grad = False
+
+    def invalidate_cache(self, reset_tracking: bool = False) -> None:
+        self._cached_col_tm = None
+        self._cached_col_sig = None
+        self._cached_col_has_grad = False
+        self._cached_col_epoch = -1
+        self._base_col_tm = None
+        self._base_col_sig = None
+        self._base_col_has_grad = False
+        if reset_tracking:
+            self._col_params = None
+
+    def train(self, mode: bool = True):
+        if self.training != mode:
+            self.invalidate_cache()
+        return super().train(mode)
+
+    def _apply(self, fn):
+        self.invalidate_cache(reset_tracking=True)
+        return super()._apply(fn)
+
     def __iter__(self) -> Iterable[torch.nn.Module]:
         yield from self.components
 
@@ -31,9 +105,40 @@ class ColumnLayer(torch.nn.Module):
     def reset_parameters(self) -> None:
         for component in self.components:
             component.reset_parameters()
+        self.invalidate_cache()
 
-    def get_transfer_matrix(self) -> torch.Tensor:
+    def _compute_transfer_matrix(self) -> torch.Tensor:
         raise NotImplementedError("get_transfer_matrix() must be overriden in child class!")
+
+    def get_transfer_matrix(self, use_cache: bool = True) -> torch.Tensor:
+        if not use_cache or not self.cache_enabled or torch.compiler.is_compiling():
+            return self._compute_transfer_matrix()
+
+        if self._col_params is None:
+            self._init_col_cache_tracking()
+
+        need_grad = torch.is_grad_enabled() and self._col_any_requires_grad
+        sig = self._get_col_signature()
+
+        if self._cached_col_tm is not None and (not need_grad or self._cached_col_has_grad):
+            if sig == self._cached_col_sig:
+                return self._cached_col_tm
+
+        if self._base_col_tm is not None and (not need_grad or self._base_col_has_grad):
+            if sig == self._base_col_sig:
+                self._cached_col_tm = self._base_col_tm
+                self._cached_col_sig = self._base_col_sig
+                self._cached_col_has_grad = self._base_col_has_grad
+                return self._cached_col_tm
+
+        tm = self._compute_transfer_matrix()
+        sig_after = self._get_col_signature()
+        self._cached_col_tm = tm
+        self._cached_col_sig = sig_after
+        self._cached_col_has_grad = tm.requires_grad
+        if tm.requires_grad:
+            tm.register_hook(self._on_col_tm_backward)
+        return tm
 
 class MeshColumn(ColumnLayer):
     '''class for physical column of optical components.'''
@@ -59,7 +164,7 @@ class MeshColumn(ColumnLayer):
             self._mzi_scatter_idx = None
             self._base_eye_flat = None
 
-    def get_transfer_matrix(self) -> torch.Tensor:
+    def _compute_transfer_matrix(self) -> torch.Tensor:
         if len(self.components) == 0:
             return torch.eye(self.N, dtype=torch.complex64)
 
@@ -146,7 +251,7 @@ class ArrayColumn(ColumnLayer):
             self._is_contiguous_full = False
             self._comp_m_idx = None
 
-    def get_transfer_matrix(self) -> torch.Tensor:
+    def _compute_transfer_matrix(self) -> torch.Tensor:
         # Returns a 1D tensor of shape (N,) representing one row of the weight matrix
         if len(self.components) == 0:
             return torch.zeros(self.N, dtype=torch.complex64)
@@ -219,6 +324,74 @@ class CoreLayer(torch.nn.Module):
         self.forward_mode = forward_mode
 
         self.columnlayers = torch.nn.ModuleList(columnlayers)
+        self.cache_enabled: bool = True
+        self._cached_transfer_matrix: Optional[torch.Tensor] = None
+        self._cache_signature: Optional[tuple] = None
+        self._cache_has_grad: bool = False
+        self._cache_all_params: Optional[Tuple[torch.Tensor, ...]] = None
+        self._cache_any_requires_grad: bool = False
+        self._base_col_tms: Optional[List[torch.Tensor]] = None
+        self._base_suffix: Optional[List[Optional[torch.Tensor]]] = None
+        self._base_prefix: Optional[List[Optional[torch.Tensor]]] = None
+        self._base_tm: Optional[torch.Tensor] = None
+        self._base_has_grad: bool = False
+
+    def _init_cache_tracking(self) -> None:
+        all_params = tuple(self.parameters())
+        self._cache_all_params = all_params
+        if len(all_params) <= 256:
+            self._cache_eval_params = all_params
+        else:
+            step = max(1, len(all_params) // 32)
+            self._cache_eval_params = all_params[::step] + (all_params[-1],)
+        self._cache_any_requires_grad = any(p.requires_grad for p in all_params)
+
+    def _get_cache_signature(self) -> tuple:
+        if self._cache_all_params is None:
+            self._init_cache_tracking()
+        all_params = self._cache_all_params
+        if not all_params:
+            return (self.training, get_global_param_epoch())
+        tracked = all_params if self.training else self._cache_eval_params
+        p0 = all_params[0]
+        p_last = all_params[-1]
+        return (
+            self.training,
+            get_global_param_epoch(),
+            p0.data_ptr(),
+            p_last.data_ptr(),
+            tuple(map(_get_tensor_version, tracked)),
+        )
+
+    def _clear_matrix_cache_only(self) -> None:
+        self._cached_transfer_matrix = None
+        self._cache_signature = None
+        self._cache_has_grad = False
+        self._base_col_tms = None
+        self._base_suffix = None
+        self._base_prefix = None
+        self._base_tm = None
+        self._base_has_grad = False
+
+    def _on_cached_tm_backward(self, _grad: torch.Tensor) -> None:
+        self._clear_matrix_cache_only()
+
+    def invalidate_cache(self, reset_tracking: bool = False) -> None:
+        self._clear_matrix_cache_only()
+        if reset_tracking:
+            self._cache_all_params = None
+        for col in self.columnlayers:
+            if hasattr(col, "invalidate_cache"):
+                col.invalidate_cache(reset_tracking=reset_tracking)
+
+    def train(self, mode: bool = True):
+        if self.training != mode:
+            self.invalidate_cache(reset_tracking=False)
+        return super().train(mode)
+
+    def _apply(self, fn):
+        self.invalidate_cache(reset_tracking=True)
+        return super()._apply(fn)
 
     def _normalize_output_ports(self, output_ports: Optional[object], L: int) -> Union[slice, List[int]]:
         if output_ports is None:
@@ -254,9 +427,30 @@ class CoreLayer(torch.nn.Module):
     def reset_parameters(self) -> None:
         for columnlayer in self.columnlayers:
             columnlayer.reset_parameters()
+        self.invalidate_cache()
 
-    def get_transfer_matrix(self) -> torch.Tensor:
+    def _compute_transfer_matrix(self, use_cache: bool = True) -> torch.Tensor:
         raise NotImplementedError("get_transfer_matrix() must be overriden in child class!")
+
+    def get_transfer_matrix(self, use_cache: bool = True) -> torch.Tensor:
+        if not use_cache or not self.cache_enabled or torch.compiler.is_compiling():
+            return self._compute_transfer_matrix(use_cache=False)
+
+        if self._cache_all_params is None:
+            self._init_cache_tracking()
+
+        need_grad = torch.is_grad_enabled() and self._cache_any_requires_grad
+        if self._cached_transfer_matrix is not None:
+            if (not need_grad or self._cache_has_grad) and self._get_cache_signature() == self._cache_signature:
+                return self._cached_transfer_matrix
+
+        tm = self._compute_transfer_matrix(use_cache=True)
+        self._cached_transfer_matrix = tm
+        self._cache_signature = self._get_cache_signature()
+        self._cache_has_grad = tm.requires_grad
+        if tm.requires_grad:
+            tm.register_hook(self._on_cached_tm_backward)
+        return tm
 
     def _default_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
 
@@ -297,8 +491,8 @@ class CoreLayer(torch.nn.Module):
         return output_tensor[..., self.output_ports]
     
     def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        if self.backward_type == BackwardType.DEFAULT.value:
-            # 直接计算，使用PyTorch自动微分
+        if self.backward_type == BackwardType.DEFAULT.value or not torch.is_grad_enabled():
+            # 直接计算，使用PyTorch自动微分或无梯度前向
             return self._default_forward(input_tensor)
         else:
             # 使用自定义反向传播
@@ -327,6 +521,12 @@ class MeshCore(CoreLayer):
 
     def _default_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
         if self.forward_mode == ForwardMode.FIELD_PROP.value:
+            if (
+                not self.training
+                or self._cached_transfer_matrix is not None
+                or self._base_col_tms is not None
+            ) and self.cache_enabled and not torch.compiler.is_compiling():
+                return super()._default_forward(input_tensor)
             if input_tensor.ndim < 1:
                 raise ValueError(
                     f"Input tensor must have at least 1 dimension, got shape {tuple(input_tensor.shape)}"
@@ -344,14 +544,86 @@ class MeshCore(CoreLayer):
             return self._field_prop_forward(input_tensor)
         return super()._default_forward(input_tensor)
 
-    def get_transfer_matrix(self) -> torch.Tensor:
+    def _compute_transfer_matrix(self, use_cache: bool = True) -> torch.Tensor:
         if len(self.columnlayers) == 0:
             raise ValueError("columnlayers cannot be empty")
 
-        # reversed: signal propagates through columnlayers in order, so later layers multiply on the left
-        transfer_matrix = reduce(torch.matmul,
-                [layer.get_transfer_matrix() for layer in reversed(self.columnlayers)])
-        return transfer_matrix
+        if not use_cache or not self.cache_enabled or torch.compiler.is_compiling():
+            return reduce(
+                torch.matmul,
+                [
+                    layer.get_transfer_matrix(use_cache=False)
+                    if isinstance(layer, ColumnLayer)
+                    else layer.get_transfer_matrix()
+                    for layer in reversed(self.columnlayers)
+                ],
+            )
+
+        col_tms = [
+            layer.get_transfer_matrix(use_cache=True)
+            if isinstance(layer, ColumnLayer)
+            else layer.get_transfer_matrix()
+            for layer in self.columnlayers
+        ]
+        K = len(col_tms)
+        need_grad = torch.is_grad_enabled() and self._cache_any_requires_grad
+
+        if (
+            self._base_col_tms is not None
+            and len(self._base_col_tms) == K
+            and (not need_grad or self._base_has_grad)
+        ):
+            diff_idx = -1
+            diff_count = 0
+            for i, (cur_t, base_t) in enumerate(zip(col_tms, self._base_col_tms)):
+                if cur_t is not base_t:
+                    diff_idx = i
+                    diff_count += 1
+                    if diff_count > 1:
+                        break
+
+            if diff_count == 0 and self._base_tm is not None:
+                return self._base_tm
+
+            if diff_count == 1 and K >= 2 and self._base_suffix is not None:
+                if self._base_prefix is None:
+                    prefix: List[Optional[torch.Tensor]] = [None] * K
+                    acc_p = self._base_col_tms[K - 1]
+                    for i in range(K - 2, -1, -1):
+                        prefix[i] = acc_p
+                        if i > 0:
+                            acc_p = torch.matmul(acc_p, self._base_col_tms[i])
+                    self._base_prefix = prefix
+
+                left = self._base_prefix[diff_idx]
+                right = self._base_suffix[diff_idx]
+                T_c = col_tms[diff_idx]
+                if left is None:
+                    return torch.matmul(T_c, right)
+                if right is None:
+                    return torch.matmul(left, T_c)
+                return torch.matmul(torch.matmul(left, T_c), right)
+
+        if K == 1:
+            tm = col_tms[0]
+            suffix: List[Optional[torch.Tensor]] = [None]
+        else:
+            suffix = [None] * K
+            acc = col_tms[0]
+            for i in range(1, K):
+                suffix[i] = acc
+                acc = torch.matmul(col_tms[i], acc)
+            tm = acc
+
+        self._base_col_tms = col_tms
+        self._base_suffix = suffix
+        self._base_prefix = None
+        self._base_tm = tm
+        self._base_has_grad = tm.requires_grad
+        for layer in self.columnlayers:
+            if isinstance(layer, ColumnLayer):
+                layer.pin_base_cache()
+        return tm
 
 class ClementsMesh(MeshCore):
     def __init__(
@@ -400,9 +672,36 @@ class ArrayCore(CoreLayer):
         n_value = self.columnlayers[0].N if self.columnlayers else "n/a"
         return f"L={self.L}, N={n_value}"
 
-    def get_transfer_matrix(self) -> torch.Tensor:
+    def _compute_transfer_matrix(self, use_cache: bool = True) -> torch.Tensor:
         if len(self.columnlayers) == 0:
             raise ValueError("columnlayers cannot be empty")
+
+        if use_cache and self.cache_enabled and not torch.compiler.is_compiling():
+            rows = [
+                layer.get_transfer_matrix(use_cache=True)
+                if isinstance(layer, ColumnLayer)
+                else layer.get_transfer_matrix()
+                for layer in self.columnlayers
+            ]
+            need_grad = torch.is_grad_enabled() and self._cache_any_requires_grad
+            if (
+                self._base_col_tms is not None
+                and len(self._base_col_tms) == len(rows)
+                and (not need_grad or self._base_has_grad)
+                and self._base_tm is not None
+                and all(r is b for r, b in zip(rows, self._base_col_tms))
+            ):
+                return self._base_tm
+            first_T = rows[0]
+            rows = [
+                r if (r.device == first_T.device and r.dtype == first_T.dtype) else r.to(device=first_T.device, dtype=first_T.dtype)
+                for r in rows
+            ]
+            tm = torch.stack(rows, dim=0)
+            self._base_col_tms = rows
+            self._base_tm = tm
+            self._base_has_grad = tm.requires_grad
+            return tm
 
         if all(
             getattr(col, "_all_mzm", False) and getattr(col, "_is_contiguous_full", False)
@@ -418,10 +717,19 @@ class ArrayCore(CoreLayer):
             theta_mat = torch.cat(thetas).view(self.L, self.columnlayers[0].N)
             return 0.5 * (torch.exp(1j * theta_mat) + 1.0)
 
-        first_T = self.columnlayers[0].get_transfer_matrix()
+        first_T = (
+            self.columnlayers[0].get_transfer_matrix(use_cache=False)
+            if isinstance(self.columnlayers[0], ColumnLayer)
+            else self.columnlayers[0].get_transfer_matrix()
+        )
         rows = [first_T]
         for layer in self.columnlayers[1:]:
-            rows.append(layer.get_transfer_matrix().to(device=first_T.device, dtype=first_T.dtype))
+            row_t = (
+                layer.get_transfer_matrix(use_cache=False)
+                if isinstance(layer, ColumnLayer)
+                else layer.get_transfer_matrix()
+            )
+            rows.append(row_t.to(device=first_T.device, dtype=first_T.dtype))
         return torch.stack(rows, dim=0)
 
 class FCArray(ArrayCore):

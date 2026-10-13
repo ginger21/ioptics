@@ -8,6 +8,7 @@ import torch
 from torch.distributions import Bernoulli
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
+from .components import bump_global_param_epoch
 from .simulator import Simulator
 
 class Differentiator(metaclass=abc.ABCMeta):
@@ -250,9 +251,11 @@ class ParameterShiftDifferentiator(Differentiator):
                     origin_value = flat_param[idx].detach().clone()
                     try:
                         flat_param[idx].add_(torch.pi / 2)
+                        bump_global_param_epoch()
                         output_plus = model(inputs)
 
                         flat_param[idx].sub_(torch.pi)  # This makes it (original + pi/2 - pi) = (original - pi/2)
+                        bump_global_param_epoch()
                         output_minus = model(inputs)
 
                         df_dtheta = (output_plus - output_minus) / 2
@@ -262,6 +265,7 @@ class ParameterShiftDifferentiator(Differentiator):
                         grad_list.append(dl_dtheta)
                     finally:
                         flat_param[idx].copy_(origin_value)
+                        bump_global_param_epoch()
 
         # Gradient estimation - stack all individual gradients
         gradient = torch.stack(grad_list)

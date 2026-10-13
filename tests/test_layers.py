@@ -437,3 +437,118 @@ def test_clements_mesh_and_fcarray_torch_compile_compatibility() -> None:
 
     torch.testing.assert_close(out_comp, out_eager, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(x_comp.grad, x.grad, atol=1e-5, rtol=1e-5)
+
+
+def test_transfer_matrix_cache_hit_and_invalidation() -> None:
+    """Verify CoreLayer static transfer matrix caching and automatic invalidation."""
+    mesh = ClementsMesh(L=4, phase_noise_std=0.2)
+    fc = FCArray(in_dim=4, out_dim=3)
+
+    # 1. Cache hit on repeated calls without parameter updates
+    tm1 = mesh.get_transfer_matrix()
+    tm2 = mesh.get_transfer_matrix()
+    assert tm1 is tm2
+    assert mesh._cached_transfer_matrix is tm1
+
+    fc_tm1 = fc.get_transfer_matrix()
+    fc_tm2 = fc.get_transfer_matrix()
+    assert fc_tm1 is fc_tm2
+
+    # 2. Switching train <-> eval invalidates cache
+    mesh.eval()
+    assert mesh._cached_transfer_matrix is None
+    tm_eval1 = mesh.get_transfer_matrix()
+    tm_eval2 = mesh.get_transfer_matrix()
+    assert tm_eval1 is tm_eval2
+    assert not torch.allclose(tm1, tm_eval1, atol=1e-3, rtol=1e-3)
+
+    # 3. In-place parameter update invalidates cache automatically
+    mesh.train()
+    tm_train = mesh.get_transfer_matrix()
+    with torch.no_grad():
+        next(mesh.parameters()).add_(0.5)
+    tm_after_update = mesh.get_transfer_matrix()
+    assert tm_after_update is not tm_train
+    assert not torch.allclose(tm_train, tm_after_update, atol=1e-4, rtol=1e-4)
+
+    # 4. Backward pass invalidates autograd-attached cache so consecutive backwards succeed
+    x = torch.randn(2, 4, dtype=torch.complex64)
+    out1 = mesh(x)
+    (out1.abs() ** 2).sum().backward()
+    assert mesh._cached_transfer_matrix is None
+
+    out2 = mesh(x)
+    (out2.abs() ** 2).sum().backward()
+
+    # 5. reset_parameters() invalidates cache
+    _ = mesh.get_transfer_matrix()
+    assert mesh._cached_transfer_matrix is not None
+    mesh.reset_parameters()
+    assert mesh._cached_transfer_matrix is None
+
+    # 6. use_cache=False bypasses cache
+    tm_cached = mesh.get_transfer_matrix()
+    tm_uncached = mesh.get_transfer_matrix(use_cache=False)
+    assert tm_uncached is not tm_cached
+    torch.testing.assert_close(tm_uncached, tm_cached, atol=1e-6, rtol=1e-6)
+
+
+def test_cache_single_param_perturbation_and_multilayer_non_backprop() -> None:
+    """Verify column-level cache and prefix/suffix fast-path on finite-difference & parameter-shift."""
+    from ioptics.differentiators import ParameterShiftDifferentiator
+    from ioptics.models import OpticalNN
+    from ioptics.nonlinear import Abs
+
+    torch.manual_seed(2026)
+
+    # 1. Single interior parameter .data mutation in eval() mode on large mesh (L=16)
+    mesh = ClementsMesh(L=16)
+    mesh.eval()
+    x = torch.randn(4, 16, dtype=torch.complex64)
+    _ = mesh(x)
+
+    # Pick an interior parameter in the middle column (col 7, component 3)
+    interior_param = mesh.columnlayers[7].components[3].theta
+    eps = 1e-2
+    orig_val = interior_param.data.clone()
+
+    # Compute analytical gradient for that parameter first
+    mesh.train()
+    out_ag = mesh(x)
+    loss_ag = (out_ag.abs() ** 2).sum()
+    loss_ag.backward()
+    expected_grad = interior_param.grad.detach().clone()
+
+    # Now switch to eval() and compute finite-difference via .data.copy_()
+    mesh.eval()
+    with torch.no_grad():
+        _ = mesh(x)  # populate cache in eval mode
+        interior_param.data.copy_(orig_val + eps)
+        loss_plus = (mesh(x).abs() ** 2).sum()
+        interior_param.data.copy_(orig_val - eps)
+        loss_minus = (mesh(x).abs() ** 2).sum()
+        interior_param.data.copy_(orig_val)
+        fd_grad = (loss_plus - loss_minus) / (2 * eps)
+
+    torch.testing.assert_close(fd_grad.view_as(expected_grad), expected_grad, atol=1e-3, rtol=1e-2)
+
+    # 2. Multi-layer OpticalNN with ParameterShiftDifferentiator: verify cached vs uncached match
+    mesh1 = ClementsMesh(L=4)
+    mesh2 = ClementsMesh(L=4)
+    model = OpticalNN(mesh1, mesh2, Abs())
+    inputs = torch.randn(6, 4, dtype=torch.float32)
+    labels = torch.randint(0, 4, (6,))
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    diff = ParameterShiftDifferentiator()
+    grads_cached = diff.differentiate(model, inputs, loss_fn, y_label=labels)
+
+    mesh1.cache_enabled = False
+    mesh2.cache_enabled = False
+    for col in list(mesh1.columnlayers) + list(mesh2.columnlayers):
+        col.cache_enabled = False
+    grads_uncached = diff.differentiate(model, inputs, loss_fn, y_label=labels)
+
+    torch.testing.assert_close(grads_cached, grads_uncached, atol=1e-5, rtol=1e-4)
+
+

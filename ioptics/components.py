@@ -4,6 +4,98 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+from torch.optim.optimizer import register_optimizer_step_post_hook
+
+
+_GLOBAL_PARAM_EPOCH: int = 0
+
+
+def get_global_param_epoch() -> int:
+    return _GLOBAL_PARAM_EPOCH
+
+
+def bump_global_param_epoch(*_args, **_kwargs) -> None:
+    global _GLOBAL_PARAM_EPOCH
+    _GLOBAL_PARAM_EPOCH += 1
+
+
+register_optimizer_step_post_hook(bump_global_param_epoch)
+
+
+class OpticalParameter(torch.nn.Parameter):
+    """Parameter subclass that tracks per-parameter and global mutation epochs."""
+
+    def _touch(self) -> None:
+        global _GLOBAL_PARAM_EPOCH
+        _GLOBAL_PARAM_EPOCH += 1
+        self._param_epoch = _GLOBAL_PARAM_EPOCH
+
+    @property
+    def data(self):
+        self._touch()
+        return super().data
+
+    @data.setter
+    def data(self, val):
+        self._touch()
+        torch.nn.Parameter.data.__set__(self, val)
+
+    def copy_(self, *args, **kwargs):
+        self._touch()
+        return super().copy_(*args, **kwargs)
+
+    def add_(self, *args, **kwargs):
+        self._touch()
+        return super().add_(*args, **kwargs)
+
+    def sub_(self, *args, **kwargs):
+        self._touch()
+        return super().sub_(*args, **kwargs)
+
+    def mul_(self, *args, **kwargs):
+        self._touch()
+        return super().mul_(*args, **kwargs)
+
+    def div_(self, *args, **kwargs):
+        self._touch()
+        return super().div_(*args, **kwargs)
+
+    def zero_(self):
+        self._touch()
+        return super().zero_()
+
+    def fill_(self, *args, **kwargs):
+        self._touch()
+        return super().fill_(*args, **kwargs)
+
+    def __iadd__(self, other):
+        self._touch()
+        return super().__iadd__(other)
+
+    def __isub__(self, other):
+        self._touch()
+        return super().__isub__(other)
+
+    def __imul__(self, other):
+        self._touch()
+        return super().__imul__(other)
+
+    def __itruediv__(self, other):
+        self._touch()
+        return super().__itruediv__(other)
+
+    def __setitem__(self, idx, val):
+        self._touch()
+        return super().__setitem__(idx, val)
+
+    def view(self, *shape):
+        self._touch()
+        return super().view(*shape)
+
+    def detach(self):
+        self._touch()
+        return super().detach()
+
 
 
 class OpticalComponent(torch.nn.Module):
@@ -41,14 +133,14 @@ class PhaseShifter(OpticalComponent):
             raise ValueError("phase_noise_std must be non-negative")
         self.m = m
         if phi is None:
-            self.phi = torch.nn.Parameter(
+            self.phi = OpticalParameter(
                 2 * torch.pi * torch.rand(1, dtype=torch.float32)
             )
         else:
             self.phi = (
                 phi
-                if isinstance(phi, torch.nn.Parameter)
-                else torch.nn.Parameter(torch.tensor(phi, dtype=torch.float32))
+                if isinstance(phi, OpticalParameter)
+                else OpticalParameter(phi.detach().clone() if isinstance(phi, torch.Tensor) else torch.tensor(phi, dtype=torch.float32))
             )
         self.phase_noise_std = phase_noise_std
         self.noise_aware_training = noise_aware_training
@@ -67,7 +159,7 @@ class PhaseShifter(OpticalComponent):
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
-            self.phi.data = 2 * torch.pi * torch.rand_like(self.phi)
+            self.phi.copy_(2 * torch.pi * torch.rand_like(self.phi))
             if self.phase_noise_std > 0:
                 self.phase_noise_phi.copy_(
                     torch.normal(
@@ -135,25 +227,25 @@ class MZI(OpticalComponent):
         self.m = m  # input waveguide A index (0-indexed)
         self.n = n  # input waveguide B index
         if theta is None:
-            self.theta = torch.nn.Parameter(
+            self.theta = OpticalParameter(
                 2 * torch.pi * torch.rand(1, dtype=torch.float32)
             )
         else:
             self.theta = (
                 theta
-                if isinstance(theta, torch.nn.Parameter)
-                else torch.nn.Parameter(torch.tensor(theta, dtype=torch.float32))
+                if isinstance(theta, OpticalParameter)
+                else OpticalParameter(theta.detach().clone() if isinstance(theta, torch.Tensor) else torch.tensor(theta, dtype=torch.float32))
             )
 
         if phi is None:
-            self.phi = torch.nn.Parameter(
+            self.phi = OpticalParameter(
                 2 * torch.pi * torch.rand(1, dtype=torch.float32)
             )
         else:
             self.phi = (
                 phi
-                if isinstance(phi, torch.nn.Parameter)
-                else torch.nn.Parameter(torch.tensor(phi, dtype=torch.float32))
+                if isinstance(phi, OpticalParameter)
+                else OpticalParameter(phi.detach().clone() if isinstance(phi, torch.Tensor) else torch.tensor(phi, dtype=torch.float32))
             )
 
         self.phase_noise_std = phase_noise_std
@@ -196,8 +288,8 @@ class MZI(OpticalComponent):
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
-            self.theta.data = 2 * torch.pi * torch.rand_like(self.theta)
-            self.phi.data = 2 * torch.pi * torch.rand_like(self.phi)
+            self.theta.copy_(2 * torch.pi * torch.rand_like(self.theta))
+            self.phi.copy_(2 * torch.pi * torch.rand_like(self.phi))
             if self.phase_noise_std > 0:
                 noise_std = torch.tensor(
                     self.phase_noise_std,
@@ -266,14 +358,14 @@ class MZM(OpticalComponent):
         self.phase_noise_std = phase_noise_std
         self.noise_aware_training = noise_aware_training
         if theta is None:
-            self.theta = torch.nn.Parameter(
+            self.theta = OpticalParameter(
                 2 * torch.pi * torch.rand(1, dtype=torch.float32)
             )
         else:
             self.theta = (
                 theta
-                if isinstance(theta, torch.nn.Parameter)
-                else torch.nn.Parameter(torch.tensor(theta, dtype=torch.float32))
+                if isinstance(theta, OpticalParameter)
+                else OpticalParameter(theta.detach().clone() if isinstance(theta, torch.Tensor) else torch.tensor(theta, dtype=torch.float32))
             )
 
         if self.phase_noise_std > 0:
@@ -300,7 +392,7 @@ class MZM(OpticalComponent):
 
     def reset_parameters(self) -> None:
         with torch.no_grad():
-            self.theta.data = 2 * torch.pi * torch.rand_like(self.theta)
+            self.theta.copy_(2 * torch.pi * torch.rand_like(self.theta))
             if self.phase_noise_std > 0:
                 self.phase_noise_theta.copy_(
                     torch.normal(

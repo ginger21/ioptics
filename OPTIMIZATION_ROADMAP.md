@@ -212,15 +212,15 @@
 | **64** | 899.530 | 940.155 | 854.596 | 2307.264 | 3035.021 | N/A (跳过超大) |
 
 ### 阶段三：算力密集路径向量化与张量化重构（P1）(Completed ✅)
-- [x] **MZI 与列矩阵批处理**：
-  - 优化 `MZI.get_transfer_matrix`，复用指数运算并消除就地切片赋值；
-  - 重构 `MeshColumn.get_transfer_matrix`，预计算端口索引并一次性向量化批量构建整列转移矩阵。
+- [x] **MZI / MZM 与列矩阵批处理**：
+  - 优化 `MZI.get_transfer_matrix`，复用指数运算并消除就地切片赋值；将 `MZM.get_transfer_matrix` 的 3 个 $2\times 2$ 矩阵连乘化简为闭式解析解 $\frac{1}{2}(e^{i\theta} + 1)$；
+  - 重构 `MeshColumn`、`ArrayColumn` 与 `ArrayCore`（`FCArray`），预计算端口索引并一次性向量化批量构建整列/整层转移矩阵。
 - [x] **前向传递模式支持 (Field-propagation)**：
   - 引入 `ForwardMode`（`MATRIX` 与 `FIELD_PROP`），支持光场逐列传递，复杂度降至 $O(L \cdot B \cdot N^2)$；
   - 补齐等价性与梯度校验单元测试。
 - [x] **Adjoint 伴随法向量化**：
   - 代数展开 $\partial T / \partial \theta$ 与 $\partial T / \partial \phi$ 干涉项，消除单组件 $2\times 2$ 矩阵频繁创建与 `F.linear` 调用；
-  - 利用点积与张量广播一次性完成整列 MZI 伴随梯度计算。
+  - 利用点积、张量广播与矩阵外积（`adj^H @ x`）一次性完成整列 `MZI` / `PhaseShifter` 及整层 `FCArray`（`MZM`）伴随梯度计算。
 - [x] **Monte Carlo 仿真批处理并行化**：
   - 重构 `run_mc`，利用 PyTorch Batch 广播维度实现多样本并行仿真，加速比超过 **110x**。
 
@@ -256,14 +256,17 @@
 | | Bwd (Adjoint) | 3035.021 ms | 417.663 ms | **7.27x** 🚀 |
 
 ### 阶段四：内存管理、缓存机制与架构收敛（P2）
-- [ ] **静态缓存机制（Transfer Matrix Cache）**：
-  - 在 `CoreLayer` 引入 `_cached_transfer_matrix` 与参数版本跟踪。当在评估模式（`model.eval()`）或未执行参数更新时直接复用缓存，单次前向传递时间可由 ~50ms 降至 <0.05ms（提速超 1000x）。
+- [x] **静态缓存机制（Transfer Matrix Cache）与局部微扰加速 (Completed ✅)**：
+  - 引入 `OpticalParameter` 全局修改纪元追踪、二级缓存（`ColumnLayer` 列级全参数精确缓存 + `CoreLayer` 整层缓存）及 `MeshCore` 单列微扰前后缀乘积（`prefix @ T_c @ suffix`）快速路径；
+  - 100% 兼容有限差分（`.data` 原地修改）、参数位移（`ParameterShift`）与多层网络局部微扰，无假命中隐患；
+  - $N=64$ 评估模式（`model.eval()`）单次前向耗时降至 **~0.03ms**（提速 **1500x+**），同时单列微扰缓存复用使 $N=8$ `ParameterShift` 从 120.5ms 降至 **31.9ms**，$N=16$ 从 1309ms 降至 **158ms**（提速 **8.3x**），伴随法反向传播亦因复用列缓存进一步提速约 **1.4x**。
 - [ ] **组件与仿真器职责统一**：
   - 将 TIA/ADC 的非理想性计算收敛到 `components.py` 中，消除冗余代码。
 - [ ] **分布式级联光损耗模型**：
   - 实现逐层注入插损与噪声的机制，保证多层非线性网络的仿真保真度。
-- [ ] **设备与精度规范化**：
-  - 统一输入与内部张量的 `device` 和 `dtype` 处理，消除内层循环中冗余的 `.to()` 调用。
+- [x] **设备与精度规范化及遗留接口清理 (Completed ✅)**：
+  - 移除已弃用的 `OpticalNN.fit_simulation` 包装接口与遗留别名；
+  - 统一输入与内部张量的 `device` 和 `dtype` 处理，利用原生复数标量乘法与预注册组件 buffer 消除内层循环中冗余的 `.to()` 调用。
 
 ### 阶段五：未来极致加速与前沿硬件特性（Future 展望 / 待后续迭代）
 - [ ] **拓扑级稀疏波导原位传递（Sparse Waveguide In-place Propagation）**：
@@ -272,10 +275,10 @@
 - [ ] **参数位移法（Parameter Shift）批处理并行化**：
   - **背景**：当前片上原位调谐 `ParameterShift` 采用 Python `for` 逐参数串行扰动，对于 $N=64$（约 2000 个参数）耗时极长。
   - **方案**：借鉴 `run_mc` 的批处理广播思想，在 Batch 维度一次性复制并广播 $2P$ 个扰动状态，**单次大 Batch 前向传递**完成全参数位移梯度测量，提速 100x ~ 500x。
-- [ ] **消除 Host-Device (CPU-GPU) 同步屏障**：
-  - 消除仿真链路与 Auto-Gain 中的 `.item()` 调用（如 `torch.max(photocurrent).item()`），避免打断 GPU 异步流水线（Pipeline Stall），确保纯显存内高速流转。
-- [ ] **现代 PyTorch 编译器适配与算子融合（`torch.compile`）**：
-  - 适配 `torch.compile(mode="reduce-overhead")`，利用 Dynamo 与 Inductor 自动融合三角函数、相移乘法与广播操作，消除 Python 解释器开销。
+- [x] **消除 Host-Device (CPU-GPU) 同步屏障 (Completed ✅)**：
+  - 消除仿真链路 Auto-Gain 中的 `torch.max(photocurrent).item()` 调用（改为纯张量 `torch.amax` + `torch.where`）及训练批循环中的逐 Batch `.item()` 同步，避免打断 GPU 异步流水线（Pipeline Stall），确保纯显存内高速流转。
+- [x] **现代 PyTorch 编译器适配与算子融合（`torch.compile`）(Completed ✅)**：
+  - 预计算 `MeshColumn` 稀疏散射索引 `_mzi_scatter_idx` 与基底单位阵 `_base_eye_flat`，将切片就地写入改为函数式非原地 `scatter` 算子，支持 `torch.compile` 图捕获与算子融合。
 - [ ] **热串扰矩阵（Thermal Crosstalk Matrix）空间物理建模**：
   - 引入空间相邻相移器间的热扩散串扰耦合矩阵 $C \cdot \boldsymbol{\theta}$，模拟高密度集成下的片上热失真。
 

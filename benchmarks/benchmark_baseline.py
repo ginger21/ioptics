@@ -76,10 +76,10 @@ def run_benchmarks(
         print(f"\n--- Benchmark Scale N = {N} (Components: ~{N*(N-1)//2}, Columns: {N}) ---", flush=True)
         scale_result: Dict[str, Any] = {}
 
-        # 1. Transfer Matrix Build
+        # 1. Transfer Matrix Build (Uncached)
         mesh_default = ClementsMesh(L=N, backward_type=BackwardType.DEFAULT.value)
         tm_stats = benchmark_fn(
-            lambda: mesh_default.get_transfer_matrix(),
+            lambda: mesh_default.get_transfer_matrix(use_cache=False),
             warmup=warmup,
             repeats=repeats,
         )
@@ -105,6 +105,18 @@ def run_benchmarks(
         )
         scale_result["forward_b32_ms"] = fwd_b32_stats
         print(f"  Forward Pass (Batch=32): {fwd_b32_stats['median_ms']:.4f} ms (std: {fwd_b32_stats['std_ms']:.4f})", flush=True)
+
+        # 3b. Eval Forward Pass (Cached Static Matrix, Batch=1)
+        mesh_default.eval()
+        with torch.no_grad():
+            eval_b1_stats = benchmark_fn(
+                lambda: mesh_default(x_b1),
+                warmup=warmup,
+                repeats=repeats,
+            )
+        mesh_default.train()
+        scale_result["eval_forward_b1_ms"] = eval_b1_stats
+        print(f"  Eval Forward (Cached):   {eval_b1_stats['median_ms']:.4f} ms (std: {eval_b1_stats['std_ms']:.4f})", flush=True)
 
         # 4. Backward Pass: Default Autograd
         def run_backward_default():
