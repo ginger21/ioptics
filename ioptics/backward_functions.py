@@ -43,6 +43,8 @@ class ParameterShiftStrategy(BackwardStrategy):
         saved_forward_transfer_matrix: Optional[torch.Tensor] = None,
         parameter_refs: Optional[Tuple[torch.Tensor, ...]] = None,
     ) -> Tuple[torch.Tensor, ...]:
+        from .components import MZI, PhaseShifter, MZM
+
         transfer_matrix = (
             saved_forward_transfer_matrix
             if saved_forward_transfer_matrix is not None
@@ -54,8 +56,189 @@ class ParameterShiftStrategy(BackwardStrategy):
         grad_input = F.linear(grad_output, grad_transfer_matrix.conj().T)
 
         params = parameter_refs if parameter_refs is not None else tuple(optical_layer.parameters())
-        grad_list = []
+        if len(params) == 0:
+            return (grad_input,)
 
+        use_complex128 = (
+            input_tensor.dtype == torch.float64
+            or input_tensor.dtype == torch.complex128
+            or grad_output.dtype == torch.complex128
+        )
+        internal_dtype = torch.complex128 if use_complex128 else torch.complex64
+
+        has_columns = hasattr(optical_layer, "columnlayers") and len(optical_layer.columnlayers) > 0
+        can_batch_columns = has_columns and all(
+            isinstance(c, (MZI, MZM, PhaseShifter))
+            and c.theta.numel() == 1 if hasattr(c, "theta") else True
+            and (c.phi.numel() == 1 if hasattr(c, "phi") else True)
+            for col in optical_layer.columnlayers
+            for c in col.components
+        )
+
+        if can_batch_columns:
+            with torch.no_grad():
+                device = input_tensor.device
+                inp_c = input_tensor if input_tensor.dtype == internal_dtype else input_tensor.to(internal_dtype)
+                grad_out_c = grad_output if grad_output.dtype == internal_dtype else grad_output.to(internal_dtype)
+                L = optical_layer.L
+                is_array_core = optical_layer.columnlayers[0].__class__.__name__ == "ArrayColumn"
+                shift_factor = (1.0 - 1.0j) * 0.5
+                half_pi = torch.pi * 0.5
+
+                param_grad_map: Dict[int, torch.Tensor] = {}
+
+                if is_array_core:
+                    full_grad = torch.zeros(*inp_c.shape[:-1], L, dtype=internal_dtype, device=device)
+                    full_grad[..., optical_layer.output_ports] = grad_out_c
+
+                    is_full_mzm_array = all(
+                        getattr(col, "_all_mzm", False) and getattr(col, "_is_contiguous_full", False)
+                        for col in optical_layer.columnlayers
+                    )
+                    if is_full_mzm_array:
+                        N = optical_layer.columnlayers[0].N
+                        thetas = torch.cat([
+                            ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                            for col in optical_layer.columnlayers
+                            for c in col.components
+                        ]).view(L, N)
+                        t_base = (0.5 * (torch.exp(1j * thetas) + 1.0)).to(dtype=internal_dtype)
+                        t_plus = (0.5 * (torch.exp(1j * (thetas + half_pi)) + 1.0)).to(dtype=internal_dtype)
+                        dt_ps = (t_plus - t_base) * shift_factor
+
+                        x_flat = inp_c.reshape(-1, N)
+                        g_flat = full_grad.reshape(-1, L)
+                        grad_mat = ((g_flat.conj().T @ x_flat) * dt_ps).real
+
+                        for i, col in enumerate(optical_layer.columnlayers):
+                            row_g = grad_mat[i]
+                            for m, c in enumerate(col.components):
+                                param_grad_map[id(c.theta)] = row_g[m].to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
+                    else:
+                        for i, col in enumerate(optical_layer.columnlayers):
+                            g_row = full_grad[..., i]
+                            for c in col.components:
+                                apply_noise = not col.training or c.noise_aware_training
+                                if isinstance(c, MZM):
+                                    theta = (c.theta + c.phase_noise_theta) if apply_noise else c.theta
+                                    t_base = (0.5 * (torch.exp(1j * theta) + 1.0)).to(dtype=internal_dtype)
+                                    t_plus = (0.5 * (torch.exp(1j * (theta + half_pi)) + 1.0)).to(dtype=internal_dtype)
+                                    df = (t_plus - t_base) * inp_c[..., c.m] * shift_factor
+                                    gt = _sum_all_dims(g_row.conj() * df).real
+                                    param_grad_map[id(c.theta)] = gt.to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
+                                elif isinstance(c, PhaseShifter):
+                                    phi = (c.phi + c.phase_noise_phi) if apply_noise else c.phi
+                                    t_base = torch.exp(1j * phi).to(dtype=internal_dtype)
+                                    t_plus = torch.exp(1j * (phi + half_pi)).to(dtype=internal_dtype)
+                                    df = (t_plus - t_base) * inp_c[..., c.m] * shift_factor
+                                    gp = _sum_all_dims(g_row.conj() * df).real
+                                    param_grad_map[id(c.phi)] = gp.to(device=c.phi.device, dtype=c.phi.dtype).reshape_as(c.phi)
+                else:
+                    forward_fields = []
+                    col_tms = []
+                    cur = inp_c
+                    for col in optical_layer.columnlayers:
+                        forward_fields.append(cur)
+                        T_c = col.get_transfer_matrix().to(device=device, dtype=internal_dtype)
+                        col_tms.append(T_c)
+                        cur = F.linear(cur, T_c)
+
+                    full_grad = torch.zeros(*inp_c.shape[:-1], L, dtype=internal_dtype, device=device)
+                    full_grad[..., optical_layer.output_ports] = grad_out_c
+                    adj = full_grad
+
+                    for i in reversed(range(len(optical_layer.columnlayers))):
+                        col = optical_layer.columnlayers[i]
+                        A_fwd = forward_fields[i]
+                        is_pure_mzi = getattr(col, "_all_mzi", False)
+
+                        if is_pure_mzi:
+                            m_idx = col._mzi_m_idx if col._mzi_m_idx.device == device else col._mzi_m_idx.to(device)
+                            n_idx = col._mzi_n_idx if col._mzi_n_idx.device == device else col._mzi_n_idx.to(device)
+                            thetas = torch.cat([
+                                ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                                for c in col.components
+                            ])
+                            phis = torch.cat([
+                                ((c.phi + c.phase_noise_phi) if (not col.training or c.noise_aware_training) else c.phi).view(1)
+                                for c in col.components
+                            ])
+
+                            a_m = A_fwd[..., m_idx]
+                            a_n = A_fwd[..., n_idx]
+                            adj_m = adj[..., m_idx]
+                            adj_n = adj[..., n_idx]
+
+                            e_iphi = torch.exp(1j * phis).to(dtype=internal_dtype)
+                            e_itheta = torch.exp(1j * thetas).to(dtype=internal_dtype)
+                            y_m = 0.5 * e_iphi * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
+                            y_n = 0.5j * (e_itheta + 1.0) * a_m + 0.5 * (1.0 - e_itheta) * a_n
+
+                            # Batch +pi/2 shift on all thetas in this column simultaneously
+                            e_itheta_p = torch.exp(1j * (thetas + half_pi)).to(dtype=internal_dtype)
+                            y_m_tp = 0.5 * e_iphi * ((e_itheta_p - 1.0) * a_m + 1j * (1.0 + e_itheta_p) * a_n)
+                            y_n_tp = 0.5j * (e_itheta_p + 1.0) * a_m + 0.5 * (1.0 - e_itheta_p) * a_n
+                            df_m_t = (y_m_tp - y_m) * shift_factor
+                            df_n_t = (y_n_tp - y_n) * shift_factor
+                            term_t = adj_m.conj() * df_m_t + adj_n.conj() * df_n_t
+                            grad_t_vec = term_t.sum(dim=tuple(range(term_t.ndim - 1))).real if term_t.ndim > 1 else term_t.real
+
+                            # Batch +pi/2 shift on all phis in this column simultaneously
+                            e_iphi_p = torch.exp(1j * (phis + half_pi)).to(dtype=internal_dtype)
+                            y_m_pp = 0.5 * e_iphi_p * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
+                            df_m_p = (y_m_pp - y_m) * shift_factor
+                            term_p = adj_m.conj() * df_m_p
+                            grad_p_vec = term_p.sum(dim=tuple(range(term_p.ndim - 1))).real if term_p.ndim > 1 else term_p.real
+
+                            for k, c in enumerate(col.components):
+                                param_grad_map[id(c.theta)] = grad_t_vec[k].to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
+                                param_grad_map[id(c.phi)] = grad_p_vec[k].to(device=c.phi.device, dtype=c.phi.dtype).reshape_as(c.phi)
+                        else:
+                            for c in col.components:
+                                apply_noise = not col.training or c.noise_aware_training
+                                if isinstance(c, MZI):
+                                    m, n = c.m, c.n
+                                    theta = (c.theta + c.phase_noise_theta) if apply_noise else c.theta
+                                    phi = (c.phi + c.phase_noise_phi) if apply_noise else c.phi
+                                    a_m, a_n = A_fwd[..., m], A_fwd[..., n]
+                                    adj_m, adj_n = adj[..., m], adj[..., n]
+                                    e_iphi = torch.exp(1j * phi).to(dtype=internal_dtype)
+                                    e_itheta = torch.exp(1j * theta).to(dtype=internal_dtype)
+                                    y_m = 0.5 * e_iphi * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
+                                    y_n = 0.5j * (e_itheta + 1.0) * a_m + 0.5 * (1.0 - e_itheta) * a_n
+
+                                    e_itheta_p = torch.exp(1j * (theta + half_pi)).to(dtype=internal_dtype)
+                                    y_m_tp = 0.5 * e_iphi * ((e_itheta_p - 1.0) * a_m + 1j * (1.0 + e_itheta_p) * a_n)
+                                    y_n_tp = 0.5j * (e_itheta_p + 1.0) * a_m + 0.5 * (1.0 - e_itheta_p) * a_n
+                                    gt = _sum_all_dims((adj_m.conj() * (y_m_tp - y_m) + adj_n.conj() * (y_n_tp - y_n)) * shift_factor).real
+
+                                    e_iphi_p = torch.exp(1j * (phi + half_pi)).to(dtype=internal_dtype)
+                                    y_m_pp = 0.5 * e_iphi_p * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
+                                    gp = _sum_all_dims(adj_m.conj() * (y_m_pp - y_m) * shift_factor).real
+
+                                    param_grad_map[id(c.theta)] = gt.to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
+                                    param_grad_map[id(c.phi)] = gp.to(device=c.phi.device, dtype=c.phi.dtype).reshape_as(c.phi)
+                                elif isinstance(c, PhaseShifter):
+                                    m = c.m
+                                    phi = (c.phi + c.phase_noise_phi) if apply_noise else c.phi
+                                    t_base = torch.exp(1j * phi).to(dtype=internal_dtype)
+                                    t_plus = torch.exp(1j * (phi + half_pi)).to(dtype=internal_dtype)
+                                    gp = _sum_all_dims(adj[..., m].conj() * (t_plus - t_base) * A_fwd[..., m] * shift_factor).real
+                                    param_grad_map[id(c.phi)] = gp.to(device=c.phi.device, dtype=c.phi.dtype).reshape_as(c.phi)
+                                elif isinstance(c, MZM):
+                                    m = c.m
+                                    theta = (c.theta + c.phase_noise_theta) if apply_noise else c.theta
+                                    t_base = (0.5 * (torch.exp(1j * theta) + 1.0)).to(dtype=internal_dtype)
+                                    t_plus = (0.5 * (torch.exp(1j * (theta + half_pi)) + 1.0)).to(dtype=internal_dtype)
+                                    gt = _sum_all_dims(adj[..., m].conj() * (t_plus - t_base) * A_fwd[..., m] * shift_factor).real
+                                    param_grad_map[id(c.theta)] = gt.to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
+
+                        adj = F.linear(adj, col_tms[i].conj().T)
+
+                if all(id(p) in param_grad_map for p in params):
+                    return grad_input, *[param_grad_map[id(p)] for p in params]
+
+        grad_list = []
         with torch.no_grad():
             for param in params:
                 origin_value = param.data.clone()

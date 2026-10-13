@@ -354,3 +354,34 @@ def test_differentiators_reject_nonfinite_loss():
         differentiator.differentiate(model, inputs, nan_loss_fn, y_label=targets)
     with pytest.raises(ValueError, match="loss must be finite"):
         differentiator.differentiate(model, inputs, inf_loss_fn, y_label=targets)
+
+
+def test_parameter_shift_differentiator_batched_matches_serial_and_fcarray() -> None:
+    """Verify batched ParameterShiftDifferentiator matches serial two-point shift on ClementsMesh and FCArray."""
+    from ioptics.layers import FCArray
+    from ioptics.nonlinear import Abs
+
+    torch.manual_seed(2026)
+    mesh = ClementsMesh(L=6)
+    fc = FCArray(in_dim=6, out_dim=4)
+    model = OpticalNN(mesh, fc, Abs())
+    inputs = torch.randn(4, 6, dtype=torch.float32)
+    targets = torch.randint(0, 4, (4,))
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    diff = ParameterShiftDifferentiator()
+    grads_batched = diff.differentiate(model, inputs, loss_fn, y_label=targets)
+
+    # Compute reference serial two-point shift by wrapping model in a non-Sequential container
+    class NonSequentialWrapper(torch.nn.Module):
+        def __init__(self, inner: torch.nn.Module) -> None:
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.inner(x)
+
+    wrapped_model = NonSequentialWrapper(model)
+    grads_serial = diff.differentiate(wrapped_model, inputs, loss_fn, y_label=targets)
+
+    torch.testing.assert_close(grads_batched, grads_serial, atol=1e-5, rtol=1e-4)

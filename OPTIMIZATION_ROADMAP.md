@@ -272,9 +272,9 @@
 - [ ] **拓扑级稀疏波导原位传递（Sparse Waveguide In-place Propagation）**：
   - **背景**：当前逐列场传递中每列仍构建 $N\times N$ 矩阵并执行全矩阵乘法（$O(N^2)$）。
   - **方案**：物理上每列仅有 $N/2$ 个 MZI 作用于端口 $(m_k, n_k)$，其余直通波导保持原值。通过原位仅更新 $x[..., m]$ 与 $x[..., n]$ 局部端口，单列 FLOPs 从 $O(N^2)$ 降至 $O(N)$，整网前向总复杂度从 $O(N^3)$ 降至 $O(N^2)$，运算量理论再降 10x ~ 30x。
-- [ ] **参数位移法（Parameter Shift）批处理并行化**：
-  - **背景**：当前片上原位调谐 `ParameterShift` 采用 Python `for` 逐参数串行扰动，对于 $N=64$（约 2000 个参数）耗时极长。
-  - **方案**：借鉴 `run_mc` 的批处理广播思想，在 Batch 维度一次性复制并广播 $2P$ 个扰动状态，**单次大 Batch 前向传递**完成全参数位移梯度测量，提速 100x ~ 500x。
+- [x] **参数位移法（Parameter Shift）批处理并行化 (Completed ✅)**：
+  - **背景**：此前片上原位调谐 `ParameterShiftStrategy` 与 `ParameterShiftDifferentiator` 采用 Python `for` 逐参数串行扰动，对于 $N \ge 16$ 耗时极长。
+  - **方案**：在 `ParameterShiftStrategy`、`MeshCore`/`ArrayCore.forward_parameter_shifts` 与 `ParameterShiftDifferentiator` 中，在参数批维度一次性向量化展开全部参数的 $\pm\pi/2$ 扰动状态，消除逐参数 Python 循环与全网转移矩阵重乘；`Bwd (ParamShift)` 在 $N=8$ 从 Baseline 的 `403.15ms` 骤降至 **`7.56ms`**（提速 **53.3x**），$N=16$ 从 `1309ms` 降至 **`22.07ms`**（提速 **59.3x**），$N=32$ 仅需 **`66.59ms`**，$N=64$（4032 参数）由原先不可行的数十秒缩短至 **`394.05ms`**。
 - [x] **消除 Host-Device (CPU-GPU) 同步屏障 (Completed ✅)**：
   - 消除仿真链路 Auto-Gain 中的 `torch.max(photocurrent).item()` 调用（改为纯张量 `torch.amax` + `torch.where`）及训练批循环中的逐 Batch `.item()` 同步，避免打断 GPU 异步流水线（Pipeline Stall），确保纯显存内高速流转。
 - [x] **现代 PyTorch 编译器适配与算子融合（`torch.compile`）(Completed ✅)**：

@@ -625,6 +625,114 @@ class MeshCore(CoreLayer):
                 layer.pin_base_cache()
         return tm
 
+    def forward_parameter_shifts(
+        self,
+        input_tensor: torch.Tensor,
+        shift: float = torch.pi * 0.5,
+    ) -> Optional[Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]]:
+        """Batch-compute outputs for +shift and -shift on all trainable scalar MZI/MZM/PS parameters in one pass."""
+        if not all(
+            isinstance(c, (MZI, MZM, PhaseShifter))
+            and (c.theta.numel() == 1 if hasattr(c, "theta") else True)
+            and (c.phi.numel() == 1 if hasattr(c, "phi") else True)
+            for col in self.columnlayers
+            for c in col.components
+        ):
+            return None
+
+        if not torch.is_complex(input_tensor):
+            internal_dtype = torch.complex128 if input_tensor.dtype == torch.float64 else torch.complex64
+            inp_c = input_tensor.to(internal_dtype)
+        else:
+            internal_dtype = input_tensor.dtype
+            inp_c = input_tensor
+
+        device = inp_c.device
+        L = self.L
+
+        with torch.no_grad():
+            fields = []
+            col_tms = []
+            cur = inp_c
+            for col in self.columnlayers:
+                fields.append(cur)
+                T_c = col.get_transfer_matrix().to(device=device, dtype=internal_dtype)
+                col_tms.append(T_c)
+                cur = F.linear(cur, T_c)
+            full_base = cur
+
+            K_cols = len(col_tms)
+            suffix_prod: List[torch.Tensor] = [None] * K_cols  # type: ignore[list-item]
+            acc_s = torch.eye(L, dtype=internal_dtype, device=device)
+            for i in reversed(range(K_cols)):
+                suffix_prod[i] = acc_s
+                if i > 0:
+                    acc_s = torch.matmul(acc_s, col_tms[i])
+
+            param_list: List[torch.Tensor] = []
+            plus_chunks: List[torch.Tensor] = []
+            minus_chunks: List[torch.Tensor] = []
+
+            for i, col in enumerate(self.columnlayers):
+                A_fwd = fields[i]
+                S_i = suffix_prod[i]
+                if getattr(col, "_all_mzi", False) and all(
+                    c.theta.requires_grad and c.phi.requires_grad for c in col.components
+                ):
+                    m_idx = col._mzi_m_idx if col._mzi_m_idx.device == device else col._mzi_m_idx.to(device)
+                    n_idx = col._mzi_n_idx if col._mzi_n_idx.device == device else col._mzi_n_idx.to(device)
+                    thetas = torch.cat([
+                        ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                        for c in col.components
+                    ])
+                    phis = torch.cat([
+                        ((c.phi + c.phase_noise_phi) if (not col.training or c.noise_aware_training) else c.phi).view(1)
+                        for c in col.components
+                    ])
+                    for c in col.components:
+                        param_list.append(c.theta)
+                        param_list.append(c.phi)
+
+                    a_m = A_fwd[..., m_idx]
+                    a_n = A_fwd[..., n_idx]
+                    e_iphi = torch.exp(1j * phis).to(dtype=internal_dtype)
+                    e_itheta = torch.exp(1j * thetas).to(dtype=internal_dtype)
+                    y_m = 0.5 * e_iphi * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
+                    y_n = 0.5j * (e_itheta + 1.0) * a_m + 0.5 * (1.0 - e_itheta) * a_n
+
+                    e_it_p = torch.exp(1j * (thetas + shift)).to(dtype=internal_dtype)
+                    e_it_m = torch.exp(1j * (thetas - shift)).to(dtype=internal_dtype)
+                    dym_tp = 0.5 * e_iphi * ((e_it_p - 1.0) * a_m + 1j * (1.0 + e_it_p) * a_n) - y_m
+                    dyn_tp = (0.5j * (e_it_p + 1.0) * a_m + 0.5 * (1.0 - e_it_p) * a_n) - y_n
+                    dym_tm = 0.5 * e_iphi * ((e_it_m - 1.0) * a_m + 1j * (1.0 + e_it_m) * a_n) - y_m
+                    dyn_tm = (0.5j * (e_it_m + 1.0) * a_m + 0.5 * (1.0 - e_it_m) * a_n) - y_n
+
+                    e_ip_p = torch.exp(1j * (phis + shift)).to(dtype=internal_dtype)
+                    e_ip_m = torch.exp(1j * (phis - shift)).to(dtype=internal_dtype)
+                    dym_pp = 0.5 * e_ip_p * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n) - y_m
+                    dym_pm = 0.5 * e_ip_m * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n) - y_m
+
+                    S_m = S_i[:, m_idx].T  # (K, L)
+                    S_n = S_i[:, n_idx].T  # (K, L)
+
+                    dt_plus = dym_tp.unsqueeze(-1) * S_m + dyn_tp.unsqueeze(-1) * S_n
+                    dt_minus = dym_tm.unsqueeze(-1) * S_m + dyn_tm.unsqueeze(-1) * S_n
+                    dp_plus = dym_pp.unsqueeze(-1) * S_m
+                    dp_minus = dym_pm.unsqueeze(-1) * S_m
+
+                    lead_shape = inp_c.shape[:-1]
+                    plus_chunks.append(torch.stack([dt_plus, dp_plus], dim=-2).reshape(*lead_shape, -1, L))
+                    minus_chunks.append(torch.stack([dt_minus, dp_minus], dim=-2).reshape(*lead_shape, -1, L))
+                else:
+                    return None
+
+            if not param_list:
+                return ([], full_base.unsqueeze(-2)[..., self.output_ports], full_base.unsqueeze(-2)[..., self.output_ports])
+
+            out_plus = (full_base.unsqueeze(-2) + torch.cat(plus_chunks, dim=-2))[..., self.output_ports]
+            out_minus = (full_base.unsqueeze(-2) + torch.cat(minus_chunks, dim=-2))[..., self.output_ports]
+            return param_list, out_plus, out_minus
+
 class ClementsMesh(MeshCore):
     def __init__(
         self,
@@ -731,6 +839,50 @@ class ArrayCore(CoreLayer):
             )
             rows.append(row_t.to(device=first_T.device, dtype=first_T.dtype))
         return torch.stack(rows, dim=0)
+
+    def forward_parameter_shifts(
+        self,
+        input_tensor: torch.Tensor,
+        shift: float = torch.pi * 0.5,
+    ) -> Optional[Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]]:
+        """Batch-compute outputs for +shift and -shift on all trainable MZM parameters in one pass."""
+        if not all(
+            getattr(col, "_all_mzm", False)
+            and getattr(col, "_is_contiguous_full", False)
+            and all(c.theta.requires_grad and c.theta.numel() == 1 for c in col.components)
+            for col in self.columnlayers
+        ):
+            return None
+
+        if not torch.is_complex(input_tensor):
+            internal_dtype = torch.complex128 if input_tensor.dtype == torch.float64 else torch.complex64
+            inp_c = input_tensor.to(internal_dtype)
+        else:
+            internal_dtype = input_tensor.dtype
+            inp_c = input_tensor
+
+        L = self.L
+        N = self.columnlayers[0].N
+        with torch.no_grad():
+            param_list = [c.theta for col in self.columnlayers for c in col.components]
+            thetas = torch.cat([
+                ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                for col in self.columnlayers
+                for c in col.components
+            ]).view(L, N)
+            t_base = (0.5 * (torch.exp(1j * thetas) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
+            t_plus = (0.5 * (torch.exp(1j * (thetas + shift)) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
+            t_minus = (0.5 * (torch.exp(1j * (thetas - shift)) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
+
+            full_base = F.linear(inp_c, t_base)  # (..., L)
+            delta_p = (t_plus - t_base) * inp_c.unsqueeze(-2)  # (..., L, N)
+            delta_m = (t_minus - t_base) * inp_c.unsqueeze(-2)  # (..., L, N)
+
+            eye_L = torch.eye(L, dtype=internal_dtype, device=inp_c.device)  # (L, L)
+            lead_shape = inp_c.shape[:-1]
+            plus_all = full_base.unsqueeze(-2) + (delta_p.unsqueeze(-1) * eye_L.unsqueeze(-2)).reshape(*lead_shape, L * N, L)
+            minus_all = full_base.unsqueeze(-2) + (delta_m.unsqueeze(-1) * eye_L.unsqueeze(-2)).reshape(*lead_shape, L * N, L)
+            return param_list, plus_all[..., self.output_ports], minus_all[..., self.output_ports]
 
 class FCArray(ArrayCore):
     """Fully-connected optical array: maps in_dim inputs to out_dim outputs.

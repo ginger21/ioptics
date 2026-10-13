@@ -241,6 +241,47 @@ class ParameterShiftDifferentiator(Differentiator):
         _validate_scalar_loss(loss)
         dloss_df = torch.autograd.grad(loss, output, allow_unused=True)[0]
 
+        if isinstance(model, torch.nn.Sequential) and len(model) > 0:
+            can_batch = True
+            stage_inputs = []
+            cur_x = inputs
+            with torch.no_grad():
+                for stage in model:
+                    stage_inputs.append(cur_x)
+                    stage_params = [p for p in stage.parameters() if p.requires_grad]
+                    if stage_params and not hasattr(stage, "forward_parameter_shifts"):
+                        can_batch = False
+                        break
+                    cur_x = stage(cur_x)
+
+            if can_batch:
+                batch_grads: dict[int, torch.Tensor] = {}
+                batch_ok = True
+                with torch.no_grad():
+                    for idx_stage, stage in enumerate(model):
+                        stage_params = [p for p in stage.parameters() if p.requires_grad]
+                        if not stage_params:
+                            continue
+                        shifted = stage.forward_parameter_shifts(stage_inputs[idx_stage], shift=torch.pi * 0.5)
+                        if shifted is None:
+                            batch_ok = False
+                            break
+                        param_refs, out_plus, out_minus = shifted
+                        for tail_stage in model[idx_stage + 1 :]:
+                            out_plus = tail_stage(out_plus)
+                            out_minus = tail_stage(out_minus)
+                        df_all = (out_plus - out_minus) * 0.5
+                        # Sum over all dimensions except the parameter dimension (-2 when output is >=1D)
+                        param_dim = inp_param_dim = out_plus.ndim - output.ndim
+                        weighted = dloss_df.unsqueeze(param_dim) * df_all
+                        reduce_dims = tuple(d for d in range(weighted.ndim) if d != param_dim)
+                        stage_grad_vec = weighted.sum(dim=reduce_dims) if reduce_dims else weighted
+                        for p_ref, g_val in zip(param_refs, stage_grad_vec):
+                            batch_grads[id(p_ref)] = g_val.reshape(1)
+
+                if batch_ok and all(id(p) in batch_grads for p in trainable_params):
+                    return torch.cat([batch_grads[id(p)] for p in trainable_params])
+
         grad_list = []
 
         for param in trainable_params:

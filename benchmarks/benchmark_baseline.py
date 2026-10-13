@@ -55,7 +55,7 @@ def run_benchmarks(
     scales: List[int],
     repeats: int = 5,
     warmup: int = 2,
-    skip_param_shift_threshold: int = 8,
+    skip_param_shift_threshold: int = 64,
 ) -> Dict[str, Any]:
     print("=" * 80, flush=True)
     print(f"Running ioptics Performance Benchmark (Scales: {scales})", flush=True)
