@@ -206,67 +206,6 @@ class SimulationTrace:
 
 
 # ---------------------------------------------------------------------------
-# TIA / ADC non-ideality helpers (P2)
-# ---------------------------------------------------------------------------
-
-def _apply_tia_non_idealities(
-    voltage: torch.Tensor,
-    *,
-    gain_error: float,
-    offset: float,
-    noise_std: float,
-    saturation_min: float,
-    saturation_max: float,
-    generator: Optional[torch.Generator],
-) -> torch.Tensor:
-    """Apply TIA non-idealities to a voltage tensor."""
-    v = voltage * gain_error + offset
-    if noise_std > 0.0:
-        v = v + torch.randn(
-            v.shape, dtype=v.dtype, device=v.device, generator=generator
-        ) * noise_std
-    if saturation_min != 0.0 or saturation_max != float("inf"):
-        v = torch.clamp(v, min=saturation_min, max=saturation_max)
-    return v
-
-
-def _apply_adc_non_idealities(
-    voltage: torch.Tensor,
-    *,
-    bits: int,
-    v_range: float,
-    gain_error: float,
-    offset: float,
-    transition_noise_lsb: float,
-    inl_coefficient: float,
-    generator: Optional[torch.Generator],
-) -> torch.Tensor:
-    """Apply ADC non-idealities and quantize a voltage tensor."""
-    if torch.is_complex(voltage):
-        voltage = voltage.real
-    lsb = v_range / (2 ** bits)
-
-    # Gain / offset on analog input
-    v = voltage * gain_error + offset
-
-    # INL (cubic distortion on normalized input)
-    if inl_coefficient != 0.0:
-        v_norm = v / v_range
-        v = v + inl_coefficient * v_norm ** 3 * v_range
-
-    # Transition noise (DNL-like) -- added before quantization
-    if transition_noise_lsb > 0.0:
-        v = v + torch.randn(
-            v.shape, dtype=v.dtype, device=v.device, generator=generator
-        ) * (transition_noise_lsb * lsb)
-
-    # Single quantization step
-    clipped = torch.clamp(v, 0.0, v_range)
-    code = torch.clamp(torch.round(clipped / lsb), 0, 2 ** bits - 1)
-    return torch.clamp(code * lsb, 0.0, v_range)
-
-
-# ---------------------------------------------------------------------------
 # Simulator class
 # ---------------------------------------------------------------------------
 
@@ -573,44 +512,28 @@ class Simulator:
 
         # --- TIA ---
         eff_auto_gain = auto_gain if auto_gain is not None else cfg.auto_gain
-        if eff_auto_gain:
-            # Auto-gain: dynamically scale transimpedance on-device without CPU-GPU .item() sync
-            max_current = torch.amax(photocurrent)
-            target_voltage = 0.85 * cfg.adc_v_range
-            dynamic_gain = torch.clamp(target_voltage / torch.clamp(max_current, min=1e-9), max=1e7)
-            eff_transimpedance = torch.where(
-                max_current > 1e-9,
-                dynamic_gain,
-                torch.tensor(cfg.tia_transimpedance, dtype=photocurrent.dtype, device=photocurrent.device),
-            )
-            voltage = photocurrent * eff_transimpedance
-        else:
-            eff_transimpedance = cfg.tia_transimpedance
-            tia = TIA(transimpedance=eff_transimpedance)
-            voltage = tia.simulate(photocurrent)
-
-        # Apply TIA non-idealities (P2)
-        voltage = _apply_tia_non_idealities(
-            voltage,
+        tia = TIA(
+            transimpedance=cfg.tia_transimpedance,
             gain_error=cfg.tia_gain_error,
             offset=cfg.tia_offset,
             noise_std=cfg.tia_noise_std,
             saturation_min=cfg.tia_saturation_min,
             saturation_max=cfg.tia_saturation_max,
-            generator=effective_gen,
+            auto_gain=eff_auto_gain,
+            adc_v_range=cfg.adc_v_range,
         )
+        voltage = tia.simulate(photocurrent, generator=effective_gen)
 
         # --- ADC (non-idealities + quantization) ---
-        output = _apply_adc_non_idealities(
-            voltage,
+        adc = ADC(
             bits=cfg.adc_bits,
             v_range=cfg.adc_v_range,
             gain_error=cfg.adc_gain_error,
             offset=cfg.adc_offset,
             transition_noise_lsb=cfg.adc_transition_noise_lsb,
             inl_coefficient=cfg.adc_inl_coefficient,
-            generator=effective_gen,
         )
+        output = adc.simulate(voltage, generator=effective_gen)
 
         # --- Digital Normalization ---
         eff_normalize = normalize if normalize is not None else cfg.normalize
@@ -618,7 +541,7 @@ class Simulator:
             if eff_auto_gain:
                 norm_scale = 0.85 * cfg.adc_v_range
             else:
-                norm_scale = cfg.detector_responsivity * eff_transimpedance
+                norm_scale = cfg.detector_responsivity * cfg.tia_transimpedance
                 if norm_scale <= 0.0:
                     norm_scale = cfg.adc_v_range
             output = torch.clamp(output / norm_scale, 0.0, 1.0)

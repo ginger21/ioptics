@@ -560,44 +560,121 @@ class Detector(OpticalComponent):
 class TIA(OpticalComponent):
     """Class for a Transimpedance Amplifier"""
 
-    def __init__(self, transimpedance: float = 1e2):
+    def __init__(
+        self,
+        transimpedance: float = 1e2,
+        *,
+        gain_error: float = 1.0,
+        offset: float = 0.0,
+        noise_std: float = 0.0,
+        saturation_min: float = 0.0,
+        saturation_max: float = float("inf"),
+        auto_gain: bool = False,
+        adc_v_range: float = 2.0,
+    ):
         super().__init__([], dof=1)
         if transimpedance <= 0:
             raise ValueError("transimpedance must be positive")
+        if noise_std < 0:
+            raise ValueError("noise_std must be non-negative")
+        if saturation_min > saturation_max:
+            raise ValueError("saturation_min must be <= saturation_max")
+        if adc_v_range <= 0:
+            raise ValueError("adc_v_range must be positive")
         self.transimpedance = transimpedance  # 100 ohm
+        self.gain_error = gain_error
+        self.offset = offset
+        self.noise_std = noise_std
+        self.saturation_min = saturation_min
+        self.saturation_max = saturation_max
+        self.auto_gain = auto_gain
+        self.adc_v_range = adc_v_range
 
     def __repr__(self):
         return "<TIA, transimpedance = {}>".format(self.transimpedance)
 
-    def simulate(self, photocurrent):
-        return self.transimpedance * photocurrent
+    def simulate(
+        self, photocurrent: torch.Tensor, generator: Optional[torch.Generator] = None
+    ) -> torch.Tensor:
+        if self.auto_gain:
+            max_current = torch.amax(photocurrent)
+            target_voltage = 0.85 * self.adc_v_range
+            dynamic_gain = torch.clamp(
+                target_voltage / torch.clamp(max_current, min=1e-9), max=1e7
+            )
+            eff_transimpedance = torch.where(
+                max_current > 1e-9,
+                dynamic_gain,
+                torch.tensor(
+                    self.transimpedance,
+                    dtype=photocurrent.dtype,
+                    device=photocurrent.device,
+                ),
+            )
+            voltage = photocurrent * eff_transimpedance
+        else:
+            voltage = self.transimpedance * photocurrent
+
+        v = voltage * self.gain_error + self.offset
+        if self.noise_std > 0.0:
+            v = v + torch.randn(
+                v.shape, dtype=v.dtype, device=v.device, generator=generator
+            ) * self.noise_std
+        if self.saturation_min != 0.0 or self.saturation_max != float("inf"):
+            v = torch.clamp(v, min=self.saturation_min, max=self.saturation_max)
+        return v
 
 
 class ADC(OpticalComponent):
     """Class for an Analog-to-Digital Converter"""
 
-    def __init__(self, bits: int = 12, v_range: float = 2.0):
+    def __init__(
+        self,
+        bits: int = 12,
+        v_range: float = 2.0,
+        *,
+        gain_error: float = 1.0,
+        offset: float = 0.0,
+        transition_noise_lsb: float = 0.0,
+        inl_coefficient: float = 0.0,
+    ):
         super().__init__([], dof=1)
         if not isinstance(bits, int) or bits <= 0:
             raise ValueError("bits must be a positive integer")
         if v_range <= 0:
             raise ValueError("v_range must be positive")
+        if transition_noise_lsb < 0:
+            raise ValueError("transition_noise_lsb must be non-negative")
         self.bits = bits
         self.v_range = v_range
         self.lsb = self.v_range / (2**self.bits)  # least significant bit
+        self.gain_error = gain_error
+        self.offset = offset
+        self.transition_noise_lsb = transition_noise_lsb
+        self.inl_coefficient = inl_coefficient
 
     def __repr__(self):
         return "<ADC, bits = {}>".format(self.bits)
 
-    def simulate(self, voltage):
-        # keep the voltage in the v_range
-        clipped = torch.clamp(voltage, 0, self.v_range)
+    def simulate(
+        self, voltage: torch.Tensor, generator: Optional[torch.Generator] = None
+    ) -> torch.Tensor:
+        if torch.is_complex(voltage):
+            voltage = voltage.real
 
-        # Quantize by rounding to the nearest LSB, then clamp to available codes.
+        v = voltage * self.gain_error + self.offset
+
+        if self.inl_coefficient != 0.0:
+            v_norm = v / self.v_range
+            v = v + self.inl_coefficient * (v_norm**3) * self.v_range
+
+        if self.transition_noise_lsb > 0.0:
+            v = v + torch.randn(
+                v.shape, dtype=v.dtype, device=v.device, generator=generator
+            ) * (self.transition_noise_lsb * self.lsb)
+
+        clipped = torch.clamp(v, 0.0, self.v_range)
         digital_output = torch.clamp(
             torch.round(clipped / self.lsb), 0, 2**self.bits - 1
         )
-
-        quantized = digital_output * self.lsb
-
-        return quantized
+        return torch.clamp(digital_output * self.lsb, 0.0, self.v_range)

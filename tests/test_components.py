@@ -256,3 +256,61 @@ def test_laser_warns_when_rin_noise_produces_negative_power() -> None:
     assert not torch.any(torch.isnan(output))
 
 
+def test_tia_non_idealities_standalone() -> None:
+    """TIA component should apply gain error, offset, noise, saturation, and auto-gain independently."""
+    tia = TIA(
+        transimpedance=100.0,
+        gain_error=1.5,
+        offset=0.2,
+        noise_std=0.05,
+        saturation_min=0.1,
+        saturation_max=1.8,
+    )
+    photocurrent = torch.tensor([0.0, 0.005, 0.02], dtype=torch.float32)
+
+    gen1 = torch.Generator().manual_seed(42)
+    gen2 = torch.Generator().manual_seed(42)
+    v1 = tia.simulate(photocurrent, generator=gen1)
+    v2 = tia.simulate(photocurrent, generator=gen2)
+
+    torch.testing.assert_close(v1, v2)
+    assert torch.all(v1 >= 0.1)
+    assert torch.all(v1 <= 1.8)
+
+    # Auto-gain mode
+    tia_auto = TIA(transimpedance=100.0, auto_gain=True, adc_v_range=2.0)
+    small_current = torch.tensor([1e-5, 2e-5], dtype=torch.float32)
+    v_auto = tia_auto.simulate(small_current)
+    torch.testing.assert_close(v_auto.max(), torch.tensor(0.85 * 2.0), atol=1e-5, rtol=1e-5)
+
+
+def test_adc_non_idealities_standalone() -> None:
+    """ADC component should apply gain error, offset, INL, DNL, and complex protection independently."""
+    adc_ideal = ADC(bits=12, v_range=2.0)
+    adc_nonideal = ADC(
+        bits=12,
+        v_range=2.0,
+        gain_error=1.1,
+        offset=0.05,
+        inl_coefficient=10.0,
+        transition_noise_lsb=5.0,
+    )
+    voltage = torch.tensor([0.2, 0.5, 1.0, 1.5], dtype=torch.float32)
+
+    gen1 = torch.Generator().manual_seed(99)
+    gen2 = torch.Generator().manual_seed(99)
+    out1 = adc_nonideal.simulate(voltage, generator=gen1)
+    out2 = adc_nonideal.simulate(voltage, generator=gen2)
+    out_ideal = adc_ideal.simulate(voltage)
+
+    torch.testing.assert_close(out1, out2)
+    assert not torch.allclose(out1, out_ideal)
+    assert torch.all(out1 >= 0.0) and torch.all(out1 <= 2.0)
+
+    # Complex input safeguard
+    complex_v = torch.tensor([0.5 + 0.3j, 1.0 - 0.2j], dtype=torch.complex64)
+    out_complex = adc_ideal.simulate(complex_v)
+    assert not torch.is_complex(out_complex)
+
+
+

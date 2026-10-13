@@ -260,8 +260,9 @@
   - 引入 `OpticalParameter` 全局修改纪元追踪、二级缓存（`ColumnLayer` 列级全参数精确缓存 + `CoreLayer` 整层缓存）及 `MeshCore` 单列微扰前后缀乘积（`prefix @ T_c @ suffix`）快速路径；
   - 100% 兼容有限差分（`.data` 原地修改）、参数位移（`ParameterShift`）与多层网络局部微扰，无假命中隐患；
   - $N=64$ 评估模式（`model.eval()`）单次前向耗时降至 **~0.03ms**（提速 **1500x+**），同时单列微扰缓存复用使 $N=8$ `ParameterShift` 从 120.5ms 降至 **31.9ms**，$N=16$ 从 1309ms 降至 **158ms**（提速 **8.3x**），伴随法反向传播亦因复用列缓存进一步提速约 **1.4x**。
-- [ ] **组件与仿真器职责统一**：
-  - 将 TIA/ADC 的非理想性计算收敛到 `components.py` 中，消除冗余代码。
+- [x] **组件与仿真器职责统一 (Completed ✅)**：
+  - 将 TIA（增益误差、直流失调、高斯噪声、上下限饱和截断、Auto-Gain 动态跨阻调节）与 ADC（增益误差、直流失调、三次 INL 非线性失真、DNL 过渡噪声及复数保护）的非理想性参数与计算下沉封装至 `components.py` 的 `TIA` 与 `ADC` 类中；
+  - 移除 `simulator.py` 中冗余的 `_apply_tia_non_idealities` 与 `_apply_adc_non_idealities` 外部函数，统一由 `TIA.simulate()` 与 `ADC.simulate()` 完成仿真。
 - [ ] **分布式级联光损耗模型**：
   - 实现逐层注入插损与噪声的机制，保证多层非线性网络的仿真保真度。
 - [x] **设备与精度规范化及遗留接口清理 (Completed ✅)**：
