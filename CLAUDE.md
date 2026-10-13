@@ -64,10 +64,10 @@
 - **伴随法向量化**：将单列所有 `MZI` / `PhaseShifter` 及整层 `FCArray`（`MZM`）的梯度求导通过点积与矩阵外积向量化展开，代数消解 $2\times 2$ 碎小矩阵与 `F.linear` 调用，反向梯度计算加速高达 **7.3x ~ 10.6x**。
 - **蒙特卡洛并行化**：利用 PyTorch Batch 广播维度将 `run_mc` 的串行循环重构为多样本批量并行执行，单次 100 次蒙特卡洛采样耗时从 5.1s 骤降至 45ms（加速 **114x**）。
 
-### 阶段四：缓存机制与架构收敛 (P2)
+### 阶段四：缓存机制与架构收敛 (P2) [已完成]
 - **静态转移矩阵缓存** [已完成]：构建 `OpticalParameter` 修改追踪、`ColumnLayer` 列级缓存与 `CoreLayer` 整层缓存（含 `MeshCore` 单列微扰前后缀矩阵乘积快速路径）；在 `eval()` 静态推理下 $N=64$ 延迟降至 **~0.03ms**（提速 **1500x+**），同时完整保障有限差分与参数位移等非反向传播单参数微扰训练的精确性并使 `ParameterShift` 提速 **3.8x ~ 8.3x**。
 - **职责下沉** [已完成]：将 TIA（增益误差、失调、噪声、饱和截断、Auto-Gain）与 ADC（增益误差、失调、INL 三次非线性、DNL 过渡噪声）的非理想性计算统一收敛至 `components.py` 的器件类本身，消除 `simulator.py` 中的重复逻辑。
-- **分布式级联光损耗** [待完成]：逐层注入插损与噪声，保证多层非线性网络免受虚高光功率失真影响。
+- **分布式级联光损耗** [已完成]：在 `CoreLayer`（`MeshCore`、`ClementsMesh`、`ArrayCore`、`FCArray`）与 `Simulator` 中实现 `insertion_loss_db` 与 `cascaded_loss=True` 逐层插损注入及 `SimulationTrace.layer_outputs` 中间场追踪，确保多层非线性网络（`SPMActivation`、`ElectroOpticActivation`）接收真实衰减后的光功率。
 - **规范张量生命周期与清理遗留接口** [已完成]：移除已弃用的 `OpticalNN.fit_simulation`；统一 `device` 与 `dtype` 处理，消除内层循环中冗余的 `.to()` 调用。
 
 ### 阶段五：未来极致加速与前沿硬件特性 (P3/Future)

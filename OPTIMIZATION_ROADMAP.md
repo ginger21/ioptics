@@ -255,7 +255,7 @@
 | | Bwd (Autograd) | 2307.264 ms | 218.060 ms | **10.58x** 🚀 |
 | | Bwd (Adjoint) | 3035.021 ms | 417.663 ms | **7.27x** 🚀 |
 
-### 阶段四：内存管理、缓存机制与架构收敛（P2）
+### 阶段四：内存管理、缓存机制与架构收敛（P2）(Completed ✅)
 - [x] **静态缓存机制（Transfer Matrix Cache）与局部微扰加速 (Completed ✅)**：
   - 引入 `OpticalParameter` 全局修改纪元追踪、二级缓存（`ColumnLayer` 列级全参数精确缓存 + `CoreLayer` 整层缓存）及 `MeshCore` 单列微扰前后缀乘积（`prefix @ T_c @ suffix`）快速路径；
   - 100% 兼容有限差分（`.data` 原地修改）、参数位移（`ParameterShift`）与多层网络局部微扰，无假命中隐患；
@@ -263,8 +263,8 @@
 - [x] **组件与仿真器职责统一 (Completed ✅)**：
   - 将 TIA（增益误差、直流失调、高斯噪声、上下限饱和截断、Auto-Gain 动态跨阻调节）与 ADC（增益误差、直流失调、三次 INL 非线性失真、DNL 过渡噪声及复数保护）的非理想性参数与计算下沉封装至 `components.py` 的 `TIA` 与 `ADC` 类中；
   - 移除 `simulator.py` 中冗余的 `_apply_tia_non_idealities` 与 `_apply_adc_non_idealities` 外部函数，统一由 `TIA.simulate()` 与 `ADC.simulate()` 完成仿真。
-- [ ] **分布式级联光损耗模型**：
-  - 实现逐层注入插损与噪声的机制，保证多层非线性网络的仿真保真度。
+- [x] **分布式级联光损耗模型 (Completed ✅)**：
+  - 在 `CoreLayer`（`MeshCore`、`ClementsMesh`、`ArrayCore`、`FCArray`）中支持层间插损 `insertion_loss_db` 与仿真器动态覆写机制，在 `SimulatorConfig` 与 `Simulator.run` 中默认启用 `cascaded_loss=True` 逐层注入损耗（兼容 `LAYER` 与 `COMPONENT` 两种损耗模型），并在 `SimulationTrace.layer_outputs` 中记录逐层衰减后的中间光场，消除多层非线性网络（`SPMActivation`、`ElectroOpticActivation` 等）中间层光功率虚高失真。
 - [x] **设备与精度规范化及遗留接口清理 (Completed ✅)**：
   - 移除已弃用的 `OpticalNN.fit_simulation` 包装接口与遗留别名；
   - 统一输入与内部张量的 `device` 和 `dtype` 处理，利用原生复数标量乘法与预注册组件 buffer 消除内层循环中冗余的 `.to()` 调用。

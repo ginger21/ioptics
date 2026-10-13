@@ -552,3 +552,46 @@ def test_cache_single_param_perturbation_and_multilayer_non_backprop() -> None:
     torch.testing.assert_close(grads_cached, grads_uncached, atol=1e-5, rtol=1e-4)
 
 
+def test_core_layer_insertion_loss_db_and_gradients():
+    """Verify CoreLayer insertion_loss_db scales power by 10^(-dB/10) and preserves gradient parity."""
+    import copy
+    torch.manual_seed(42)
+    loss_db = 3.0
+    mesh_lossless = ClementsMesh(L=4, insertion_loss_db=0.0)
+    mesh_default = copy.deepcopy(mesh_lossless)
+    mesh_default.insertion_loss_db = loss_db
+
+    mesh_adjoint = copy.deepcopy(mesh_default)
+    mesh_adjoint.backward_type = BackwardType.ADJOINT_VARIANT.value
+
+    mesh_ps = copy.deepcopy(mesh_default)
+    mesh_ps.backward_type = BackwardType.PARAMETER_SHIFT.value
+
+    x = torch.randn(3, 4, dtype=torch.complex64)
+    out_lossless = mesh_lossless(x)
+    out_lossy = mesh_default(x)
+
+    # Power must be attenuated by 10^(-loss_db / 10)
+    pwr_lossless = (out_lossless.abs() ** 2).sum(dim=-1)
+    pwr_lossy = (out_lossy.abs() ** 2).sum(dim=-1)
+    torch.testing.assert_close(pwr_lossy, pwr_lossless * (10.0 ** (-loss_db / 10.0)), atol=1e-5, rtol=1e-5)
+
+    # Gradient parity across Default, AdjointVariant, and ParameterShift
+    loss_def = (out_lossy.abs() ** 2).sum()
+    loss_def.backward()
+
+    loss_adj = (mesh_adjoint(x).abs() ** 2).sum()
+    loss_adj.backward()
+
+    loss_ps = (mesh_ps(x).abs() ** 2).sum()
+    loss_ps.backward()
+
+    for p_def, p_adj, p_ps in zip(mesh_default.parameters(), mesh_adjoint.parameters(), mesh_ps.parameters()):
+        torch.testing.assert_close(p_adj.grad, p_def.grad, atol=1e-4, rtol=1e-3)
+        torch.testing.assert_close(p_ps.grad, p_def.grad, atol=1e-4, rtol=1e-3)
+
+    with pytest.raises(ValueError, match="insertion_loss_db must be non-negative"):
+        ClementsMesh(L=4, insertion_loss_db=-1.0)
+
+
+

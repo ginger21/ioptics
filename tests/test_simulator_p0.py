@@ -914,4 +914,92 @@ def test_digital_normalization_scales_output_to_unit_range() -> None:
     assert out.max().item() > 0.95
 
 
+def test_cascaded_loss_in_multilayer_nonlinear_network() -> None:
+    """Distributed cascaded loss must attenuate optical field before intermediate nonlinear activations."""
+    from ioptics.layers import ClementsMesh
+    from ioptics.nonlinear import ElectroOpticActivation, SPMActivation
+
+    torch.manual_seed(123)
+    mesh1 = ClementsMesh(L=4)
+    spm = SPMActivation(gain=2.5)
+    mesh2 = ClementsMesh(L=4)
+    eo = ElectroOpticActivation(alpha=0.1, g=1.5, phi_b=0.5)
+    mesh3 = ClementsMesh(L=4)
+
+    model = torch.nn.Sequential(mesh1, spm, mesh2, eo, mesh3)
+    inp = torch.ones(4, dtype=torch.complex64) * 1.5
+
+    layer_loss_db = 3.0
+    coupling_loss_db = 0.6
+    cfg = SimulatorConfig(
+        layer_loss_db=layer_loss_db,
+        coupling_loss=coupling_loss_db,
+        laser_noise=False,
+        detector_noise=False,
+        cascaded_loss=True,
+    )
+    sim = Simulator(config=cfg)
+
+    out_cascaded, trace_cascaded = sim.run(
+        inp, model, return_trace=True, cascaded_loss=True
+    )
+    out_lumped, trace_lumped = sim.run(
+        inp, model, return_trace=True, cascaded_loss=False
+    )
+
+    # Verify trace captured all 3 optical core layers
+    assert len(trace_cascaded.layer_outputs) == 3
+
+    # Manually compute exact physical cascaded propagation
+    layer_scale = 10.0 ** (-layer_loss_db / 20.0)
+    coupling_scale = 10.0 ** (-coupling_loss_db / 20.0)
+    with torch.no_grad():
+        e1 = mesh1(inp) * layer_scale
+        e1_act = spm(e1)
+        e2 = mesh2(e1_act) * layer_scale
+        e2_act = eo(e2)
+        e3 = mesh3(e2_act) * layer_scale
+        expected_final_field = e3 * coupling_scale
+
+    torch.testing.assert_close(trace_cascaded.layer_outputs[0], e1)
+    torch.testing.assert_close(trace_cascaded.layer_outputs[1], e2)
+    torch.testing.assert_close(trace_cascaded.layer_outputs[2], e3)
+    torch.testing.assert_close(trace_cascaded.model_output_after_loss, expected_final_field)
+
+    # Cascaded loss must differ from lumped post-loss because SPM and EO depend nonlinearly on |E|^2
+    assert not torch.allclose(
+        trace_cascaded.model_output_after_loss,
+        trace_lumped.model_output_after_loss,
+    )
+
+
+def test_cascaded_loss_matches_lumped_for_purely_linear_multilayer() -> None:
+    """For purely linear multi-layer networks, cascaded loss and lumped loss must yield identical final outputs."""
+    from ioptics.layers import ClementsMesh
+
+    torch.manual_seed(77)
+    model = torch.nn.Sequential(ClementsMesh(L=4), ClementsMesh(L=4))
+    inp = torch.randn(4, dtype=torch.complex64)
+
+    sim = Simulator(
+        config=SimulatorConfig(
+            layer_loss_db=2.0,
+            coupling_loss=0.5,
+            laser_noise=False,
+            detector_noise=False,
+        )
+    )
+    out_cascaded, trace_casc = sim.run(inp, model, return_trace=True, cascaded_loss=True)
+    out_lumped, trace_lump = sim.run(inp, model, return_trace=True, cascaded_loss=False)
+
+    torch.testing.assert_close(
+        trace_casc.model_output_after_loss,
+        trace_lump.model_output_after_loss,
+        atol=1e-6,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(out_cascaded, out_lumped, atol=1e-6, rtol=1e-5)
+
+
+
 

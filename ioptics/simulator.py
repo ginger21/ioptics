@@ -115,6 +115,7 @@ class SimulatorConfig:
     # Auto-gain & digital normalization options
     auto_gain: bool = False
     normalize: bool = False
+    cascaded_loss: bool = True
 
     @staticmethod
     def from_profile(profile: HardwareProfile | str) -> SimulatorConfig:
@@ -203,6 +204,7 @@ class SimulationTrace:
     photocurrent: torch.Tensor
     voltage: torch.Tensor
     final_output: torch.Tensor
+    layer_outputs: Tuple[torch.Tensor, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +221,7 @@ class Simulator:
         profile: str = HardwareProfile.IDEAL.value,
         auto_gain: Optional[bool] = None,
         normalize: Optional[bool] = None,
+        cascaded_loss: Optional[bool] = None,
     ) -> None:
         # Resolve profile
         self._profile = HardwareProfile(profile)
@@ -233,6 +236,8 @@ class Simulator:
             overrides["auto_gain"] = auto_gain
         if normalize is not None:
             overrides["normalize"] = normalize
+        if cascaded_loss is not None:
+            overrides["cascaded_loss"] = cascaded_loss
         if overrides:
             self._config = replace(self._config, **overrides)
 
@@ -243,6 +248,7 @@ class Simulator:
         self.layer_loss_db: float = self._config.layer_loss_db
         self.coupling_loss: float = self._config.coupling_loss
         self.loss_model: str = self._config.loss_model
+        self.cascaded_loss: bool = self._config.cascaded_loss
 
     # ------------------------------------------------------------------
     # Loss computation helpers
@@ -285,6 +291,7 @@ class Simulator:
         output_domain: Optional[str] = None,
         auto_gain: Optional[bool] = None,
         normalize: Optional[bool] = None,
+        cascaded_loss: Optional[bool] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace] | Dict[str, Any]:
         """Run a forward simulation.
 
@@ -383,7 +390,21 @@ class Simulator:
             output_domain=output_domain,
             auto_gain=auto_gain,
             normalize=normalize,
+            cascaded_loss=cascaded_loss,
         )
+
+    def _compute_module_loss_db(
+        self, module: torch.nn.Module, cfg: SimulatorConfig
+    ) -> float:
+        """Compute insertion loss in dB for a single optical core module (excluding coupling loss)."""
+        if cfg.loss_model == LossModel.COMPONENT.value:
+            counts = _count_optical_components(module)
+            return (
+                counts["mzi"] * cfg.component_loss_db
+                + counts["mzm"] * cfg.mzm_loss
+                + counts["phase_shifter"] * cfg.phase_shifter_loss
+            )
+        return cfg.layer_loss_db
 
     def _run_internal(
         self,
@@ -398,6 +419,7 @@ class Simulator:
         output_domain: Optional[str] = None,
         auto_gain: Optional[bool] = None,
         normalize: Optional[bool] = None,
+        cascaded_loss: Optional[bool] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace]:
         """Internal single-run simulation with an optional config override."""
         # Validate mutual exclusivity
@@ -438,16 +460,62 @@ class Simulator:
         )
         input_optical_field = laser.simulate(E_field, generator=effective_gen)
 
-        # --- Optical model ---
-        model_output_before_loss = optical_model(input_optical_field)
-
-        # --- Resolve effective output domain ---
+        # --- Optical model & Distributed Cascaded Loss ---
+        eff_cascaded_loss = cascaded_loss if cascaded_loss is not None else cfg.cascaded_loss
+        core_layers = [
+            m for m in optical_model.modules() if isinstance(m, (MeshCore, ArrayCore))
+        ]
+        has_nonlinear = any(
+            m.__class__.__name__
+            in (
+                "SPMActivation",
+                "ElectroOpticActivation",
+                "SigmoidLikeActivation",
+                "TanhLikeActivation",
+                "SquareActivation",
+                "AbsSquared",
+            )
+            for m in optical_model.modules()
+        )
         domain_str = output_domain or cfg.output_domain
         eff_out_domain = OutputDomain(domain_str)
+        model_hint = getattr(optical_model, "output_domain", None)
 
+        use_per_layer_cascade = bool(
+            eff_cascaded_loss
+            and len(core_layers) > 0
+            and (
+                len(core_layers) > 1
+                or has_nonlinear
+                or (
+                    eff_out_domain != OutputDomain.POWER
+                    and model_hint != OutputDomain.POWER.value
+                )
+            )
+        )
+
+        injected_loss_db = 0.0
+        layer_outputs_list: List[torch.Tensor] = []
+        try:
+            for core_mod in core_layers:
+                if use_per_layer_cascade:
+                    layer_db = self._compute_module_loss_db(core_mod, cfg)
+                    core_mod._sim_loss_db_override = layer_db
+                    injected_loss_db += layer_db
+                else:
+                    core_mod._sim_loss_db_override = 0.0
+                if return_trace:
+                    core_mod._sim_trace_collector = layer_outputs_list
+
+            model_output_before_loss = optical_model(input_optical_field)
+        finally:
+            for core_mod in core_layers:
+                core_mod._sim_loss_db_override = None
+                core_mod._sim_trace_collector = None
+
+        # --- Resolve effective output domain ---
         if eff_out_domain == OutputDomain.AUTO:
             # a) Check model hint attribute
-            model_hint = getattr(optical_model, "output_domain", None)
             if model_hint in (OutputDomain.FIELD.value, OutputDomain.POWER.value):
                 eff_out_domain = OutputDomain(model_hint)
             # b) Complex tensors represent optical fields, never optical power
@@ -466,21 +534,23 @@ class Simulator:
             else:
                 eff_out_domain = OutputDomain.FIELD
 
-        # --- Insertion / coupling loss ---
+        # --- Remaining insertion / coupling loss ---
         if cfg.loss_model == LossModel.COMPONENT.value:
-            loss_db = self._compute_component_loss_for_config(optical_model, cfg)
+            total_loss_db = self._compute_component_loss_for_config(optical_model, cfg)
         else:
-            total_layers = _count_optical_layers(optical_model)
-            loss_db = total_layers * cfg.layer_loss_db + cfg.coupling_loss
+            total_layers = len(core_layers)
+            total_loss_db = total_layers * cfg.layer_loss_db + cfg.coupling_loss
+
+        remaining_loss_db = max(0.0, total_loss_db - injected_loss_db)
 
         if eff_out_domain == OutputDomain.FIELD:
             # Field amplitude attenuation: 10^(-dB/20)
-            loss_factor = 10 ** (-loss_db / 20)
+            loss_factor = 10 ** (-remaining_loss_db / 20)
             model_output_after_loss = model_output_before_loss * loss_factor
             detected_optical_power = torch.abs(model_output_after_loss) ** 2
         else:
             # Power attenuation: 10^(-dB/10)
-            loss_factor = 10 ** (-loss_db / 10)
+            loss_factor = 10 ** (-remaining_loss_db / 10)
             model_output_after_loss = model_output_before_loss * loss_factor
             if torch.is_complex(model_output_after_loss):
                 # Safeguard: if user forced POWER mode on complex output, convert to intensity
@@ -554,6 +624,7 @@ class Simulator:
                 photocurrent=photocurrent,
                 voltage=voltage,
                 final_output=output,
+                layer_outputs=tuple(layer_outputs_list),
             )
             return output, trace  # type: ignore[return-value]
 

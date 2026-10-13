@@ -310,10 +310,16 @@ class CoreLayer(torch.nn.Module):
         output_ports:Optional[slice] = None,
         backward_type: str = BackwardType.DEFAULT.value,
         forward_mode: str = ForwardMode.MATRIX.value,
+        insertion_loss_db: float = 0.0,
     ):
         super().__init__()
+        if insertion_loss_db < 0.0:
+            raise ValueError(f"insertion_loss_db must be non-negative, got {insertion_loss_db}")
         self.L = L
         self.output_ports = self._normalize_output_ports(output_ports, L)
+        self.insertion_loss_db: float = float(insertion_loss_db)
+        self._sim_loss_db_override: Optional[float] = None
+        self._sim_trace_collector: Optional[List[torch.Tensor]] = None
 
         if backward_type not in [bt.value for bt in BackwardType]:
             raise ValueError(f"Unsupported backward_type: {backward_type}")
@@ -335,6 +341,11 @@ class CoreLayer(torch.nn.Module):
         self._base_prefix: Optional[List[Optional[torch.Tensor]]] = None
         self._base_tm: Optional[torch.Tensor] = None
         self._base_has_grad: bool = False
+
+    def _effective_loss_db(self) -> float:
+        if self._sim_loss_db_override is not None:
+            return self._sim_loss_db_override
+        return self.insertion_loss_db
 
     def _init_cache_tracking(self) -> None:
         all_params = tuple(self.parameters())
@@ -493,10 +504,17 @@ class CoreLayer(torch.nn.Module):
     def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
         if self.backward_type == BackwardType.DEFAULT.value or not torch.is_grad_enabled():
             # 直接计算，使用PyTorch自动微分或无梯度前向
-            return self._default_forward(input_tensor)
+            out = self._default_forward(input_tensor)
         else:
             # 使用自定义反向传播
-            return CustomForwardFunction.apply(self, input_tensor, self.backward_type, *self.parameters())
+            out = CustomForwardFunction.apply(self, input_tensor, self.backward_type, *self.parameters())
+
+        loss_db = self._effective_loss_db()
+        if loss_db > 0.0:
+            out = out * (10.0 ** (-loss_db / 20.0))
+        if self._sim_trace_collector is not None:
+            self._sim_trace_collector.append(out)
+        return out
 
 class MeshCore(CoreLayer):
     '''class for physical mesh of optical columnlayers.'''
@@ -507,8 +525,16 @@ class MeshCore(CoreLayer):
         output_ports:Optional[slice] = None,
         backward_type: str = BackwardType.DEFAULT.value,
         forward_mode: str = ForwardMode.MATRIX.value,
+        insertion_loss_db: float = 0.0,
     ):
-        super().__init__(L, columnlayers, output_ports, backward_type, forward_mode)
+        super().__init__(
+            L,
+            columnlayers,
+            output_ports,
+            backward_type,
+            forward_mode,
+            insertion_loss_db=insertion_loss_db,
+        )
 
     def _field_prop_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
         current_field = input_tensor
@@ -727,10 +753,19 @@ class MeshCore(CoreLayer):
                     return None
 
             if not param_list:
-                return ([], full_base.unsqueeze(-2)[..., self.output_ports], full_base.unsqueeze(-2)[..., self.output_ports])
+                out_empty = full_base.unsqueeze(-2)[..., self.output_ports]
+                loss_db = self._effective_loss_db()
+                if loss_db > 0.0:
+                    out_empty = out_empty * (10.0 ** (-loss_db / 20.0))
+                return ([], out_empty, out_empty)
 
             out_plus = (full_base.unsqueeze(-2) + torch.cat(plus_chunks, dim=-2))[..., self.output_ports]
             out_minus = (full_base.unsqueeze(-2) + torch.cat(minus_chunks, dim=-2))[..., self.output_ports]
+            loss_db = self._effective_loss_db()
+            if loss_db > 0.0:
+                scale = 10.0 ** (-loss_db / 20.0)
+                out_plus = out_plus * scale
+                out_minus = out_minus * scale
             return param_list, out_plus, out_minus
 
 class ClementsMesh(MeshCore):
@@ -742,6 +777,7 @@ class ClementsMesh(MeshCore):
         noise_aware_training: bool = False,
         backward_type: str = BackwardType.DEFAULT.value,
         forward_mode: str = ForwardMode.MATRIX.value,
+        insertion_loss_db: float = 0.0,
     ):
         if L <= 0:
             raise ValueError(f"L must be positive, got {L}")
@@ -761,7 +797,14 @@ class ClementsMesh(MeshCore):
                 else:
                     columnlayer = MeshColumn(L, [MZI(m, m+1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(1, L, 2)])
             columnlayer_list.append(columnlayer)
-        super().__init__(L, columnlayer_list, output_ports = output_ports, backward_type = backward_type, forward_mode = forward_mode)
+        super().__init__(
+            L,
+            columnlayer_list,
+            output_ports=output_ports,
+            backward_type=backward_type,
+            forward_mode=forward_mode,
+            insertion_loss_db=insertion_loss_db,
+        )
 
     def extra_repr(self):
         return f"L={self.L}, phase_noise_std={self.phase_noise_std}, noise_aware_training={self.noise_aware_training}, backward_type={self.backward_type}, forward_mode={self.forward_mode}"
@@ -773,8 +816,21 @@ class ArrayCore(CoreLayer):
     sums from N input ports (columns). L may differ from N. Each ArrayColumn
     produces one row of the weight matrix.
     """
-    def __init__(self, L:int, columnlayers:List[ColumnLayer], output_ports:Optional[slice] = None, backward_type: str = BackwardType.DEFAULT.value):
-        super().__init__(L, columnlayers, output_ports, backward_type)
+    def __init__(
+        self,
+        L:int,
+        columnlayers:List[ColumnLayer],
+        output_ports:Optional[slice] = None,
+        backward_type: str = BackwardType.DEFAULT.value,
+        insertion_loss_db: float = 0.0,
+    ):
+        super().__init__(
+            L,
+            columnlayers,
+            output_ports,
+            backward_type,
+            insertion_loss_db=insertion_loss_db,
+        )
 
     def extra_repr(self):
         n_value = self.columnlayers[0].N if self.columnlayers else "n/a"
@@ -882,7 +938,14 @@ class ArrayCore(CoreLayer):
             lead_shape = inp_c.shape[:-1]
             plus_all = full_base.unsqueeze(-2) + (delta_p.unsqueeze(-1) * eye_L.unsqueeze(-2)).reshape(*lead_shape, L * N, L)
             minus_all = full_base.unsqueeze(-2) + (delta_m.unsqueeze(-1) * eye_L.unsqueeze(-2)).reshape(*lead_shape, L * N, L)
-            return param_list, plus_all[..., self.output_ports], minus_all[..., self.output_ports]
+            out_plus = plus_all[..., self.output_ports]
+            out_minus = minus_all[..., self.output_ports]
+            loss_db = self._effective_loss_db()
+            if loss_db > 0.0:
+                scale = 10.0 ** (-loss_db / 20.0)
+                out_plus = out_plus * scale
+                out_minus = out_minus * scale
+            return param_list, out_plus, out_minus
 
 class FCArray(ArrayCore):
     """Fully-connected optical array: maps in_dim inputs to out_dim outputs.
@@ -893,7 +956,15 @@ class FCArray(ArrayCore):
     form an LxN weight matrix (L = out_dim rows, N = in_dim columns), producing
     the same linear transformation as a classical fully-connected layer.
     """
-    def __init__(self, in_dim:int, out_dim:int, output_ports:Optional[slice] = None, backward_type: str = BackwardType.DEFAULT.value, noise_aware_training: bool = False):
+    def __init__(
+        self,
+        in_dim:int,
+        out_dim:int,
+        output_ports:Optional[slice] = None,
+        backward_type: str = BackwardType.DEFAULT.value,
+        noise_aware_training: bool = False,
+        insertion_loss_db: float = 0.0,
+    ):
         if in_dim <= 0:
             raise ValueError(f"in_dim must be positive, got {in_dim}")
         if out_dim <= 0:
@@ -908,7 +979,13 @@ class FCArray(ArrayCore):
             columnlayer = ArrayColumn(in_dim, [MZM(m, noise_aware_training=noise_aware_training) for m in range(in_dim)])
             columnlayer_list.append(columnlayer)
 
-        super().__init__(out_dim, columnlayer_list, output_ports, backward_type)
+        super().__init__(
+            out_dim,
+            columnlayer_list,
+            output_ports,
+            backward_type,
+            insertion_loss_db=insertion_loss_db,
+        )
 
     def extra_repr(self):
         return f"in_dim={self.in_dim}, out_dim={self.out_dim}, noise_aware_training={self.noise_aware_training}, backward_type={self.backward_type}"
