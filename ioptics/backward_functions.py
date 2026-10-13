@@ -97,11 +97,10 @@ class ParameterShiftStrategy(BackwardStrategy):
                     )
                     if is_full_mzm_array:
                         N = optical_layer.columnlayers[0].N
-                        thetas = torch.cat([
-                            ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                        thetas = torch.stack([
+                            col._get_effective_phases().to(device=device)
                             for col in optical_layer.columnlayers
-                            for c in col.components
-                        ]).view(L, N)
+                        ], dim=0)
                         t_base = (0.5 * (torch.exp(1j * thetas) + 1.0)).to(dtype=internal_dtype)
                         t_plus = (0.5 * (torch.exp(1j * (thetas + half_pi)) + 1.0)).to(dtype=internal_dtype)
                         dt_ps = (t_plus - t_base) * shift_factor
@@ -112,27 +111,57 @@ class ParameterShiftStrategy(BackwardStrategy):
 
                         for i, col in enumerate(optical_layer.columnlayers):
                             row_g = grad_mat[i]
+                            C_i = col._get_effective_crosstalk_matrix(device=row_g.device, dtype=row_g.dtype)
+                            if C_i is not None:
+                                row_g = torch.mv(C_i.T, row_g)
                             for m, c in enumerate(col.components):
                                 param_grad_map[id(c.theta)] = row_g[m].to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
                     else:
                         for i, col in enumerate(optical_layer.columnlayers):
                             g_row = full_grad[..., i]
-                            for c in col.components:
-                                apply_noise = not col.training or c.noise_aware_training
-                                if isinstance(c, MZM):
-                                    theta = (c.theta + c.phase_noise_theta) if apply_noise else c.theta
-                                    t_base = (0.5 * (torch.exp(1j * theta) + 1.0)).to(dtype=internal_dtype)
-                                    t_plus = (0.5 * (torch.exp(1j * (theta + half_pi)) + 1.0)).to(dtype=internal_dtype)
-                                    df = (t_plus - t_base) * inp_c[..., c.m] * shift_factor
-                                    gt = _sum_all_dims(g_row.conj() * df).real
-                                    param_grad_map[id(c.theta)] = gt.to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
-                                elif isinstance(c, PhaseShifter):
-                                    phi = (c.phi + c.phase_noise_phi) if apply_noise else c.phi
-                                    t_base = torch.exp(1j * phi).to(dtype=internal_dtype)
-                                    t_plus = torch.exp(1j * (phi + half_pi)).to(dtype=internal_dtype)
-                                    df = (t_plus - t_base) * inp_c[..., c.m] * shift_factor
-                                    gp = _sum_all_dims(g_row.conj() * df).real
-                                    param_grad_map[id(c.phi)] = gp.to(device=c.phi.device, dtype=c.phi.dtype).reshape_as(c.phi)
+                            if getattr(col, "_all_mzm", False):
+                                m_idx = col._comp_m_idx if col._comp_m_idx.device == device else col._comp_m_idx.to(device)
+                                thetas = col._get_effective_phases().to(device=device)
+                                t_base = (0.5 * (torch.exp(1j * thetas) + 1.0)).to(dtype=internal_dtype)
+                                t_plus = (0.5 * (torch.exp(1j * (thetas + half_pi)) + 1.0)).to(dtype=internal_dtype)
+                                df = (t_plus - t_base) * inp_c[..., m_idx] * shift_factor
+                                term = g_row.unsqueeze(-1).conj() * df
+                                grad_vec = term.sum(dim=tuple(range(term.ndim - 1))).real if term.ndim > 1 else term.real
+                                C_i = col._get_effective_crosstalk_matrix(device=grad_vec.device, dtype=grad_vec.dtype)
+                                if C_i is not None:
+                                    grad_vec = torch.mv(C_i.T, grad_vec)
+                                for k, c in enumerate(col.components):
+                                    param_grad_map[id(c.theta)] = grad_vec[k].to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
+                            elif getattr(col, "_all_ps", False):
+                                m_idx = col._comp_m_idx if col._comp_m_idx.device == device else col._comp_m_idx.to(device)
+                                phis = col._get_effective_phases().to(device=device)
+                                t_base = torch.exp(1j * phis).to(dtype=internal_dtype)
+                                t_plus = torch.exp(1j * (phis + half_pi)).to(dtype=internal_dtype)
+                                df = (t_plus - t_base) * inp_c[..., m_idx] * shift_factor
+                                term = g_row.unsqueeze(-1).conj() * df
+                                grad_vec = term.sum(dim=tuple(range(term.ndim - 1))).real if term.ndim > 1 else term.real
+                                C_i = col._get_effective_crosstalk_matrix(device=grad_vec.device, dtype=grad_vec.dtype)
+                                if C_i is not None:
+                                    grad_vec = torch.mv(C_i.T, grad_vec)
+                                for k, c in enumerate(col.components):
+                                    param_grad_map[id(c.phi)] = grad_vec[k].to(device=c.phi.device, dtype=c.phi.dtype).reshape_as(c.phi)
+                            else:
+                                for c in col.components:
+                                    apply_noise = not col.training or c.noise_aware_training
+                                    if isinstance(c, MZM):
+                                        theta = (c.theta + c.phase_noise_theta) if apply_noise else c.theta
+                                        t_base = (0.5 * (torch.exp(1j * theta) + 1.0)).to(dtype=internal_dtype)
+                                        t_plus = (0.5 * (torch.exp(1j * (theta + half_pi)) + 1.0)).to(dtype=internal_dtype)
+                                        df = (t_plus - t_base) * inp_c[..., c.m] * shift_factor
+                                        gt = _sum_all_dims(g_row.conj() * df).real
+                                        param_grad_map[id(c.theta)] = gt.to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
+                                    elif isinstance(c, PhaseShifter):
+                                        phi = (c.phi + c.phase_noise_phi) if apply_noise else c.phi
+                                        t_base = torch.exp(1j * phi).to(dtype=internal_dtype)
+                                        t_plus = torch.exp(1j * (phi + half_pi)).to(dtype=internal_dtype)
+                                        df = (t_plus - t_base) * inp_c[..., c.m] * shift_factor
+                                        gp = _sum_all_dims(g_row.conj() * df).real
+                                        param_grad_map[id(c.phi)] = gp.to(device=c.phi.device, dtype=c.phi.dtype).reshape_as(c.phi)
                 else:
                     forward_fields = []
                     col_tms = []
@@ -155,14 +184,9 @@ class ParameterShiftStrategy(BackwardStrategy):
                         if is_pure_mzi:
                             m_idx = col._mzi_m_idx if col._mzi_m_idx.device == device else col._mzi_m_idx.to(device)
                             n_idx = col._mzi_n_idx if col._mzi_n_idx.device == device else col._mzi_n_idx.to(device)
-                            thetas = torch.cat([
-                                ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
-                                for c in col.components
-                            ])
-                            phis = torch.cat([
-                                ((c.phi + c.phase_noise_phi) if (not col.training or c.noise_aware_training) else c.phi).view(1)
-                                for c in col.components
-                            ])
+                            thetas, phis = col._get_effective_phases()
+                            thetas = thetas.to(device=device)
+                            phis = phis.to(device=device)
 
                             a_m = A_fwd[..., m_idx]
                             a_n = A_fwd[..., n_idx]
@@ -189,6 +213,11 @@ class ParameterShiftStrategy(BackwardStrategy):
                             df_m_p = (y_m_pp - y_m) * shift_factor
                             term_p = adj_m.conj() * df_m_p
                             grad_p_vec = term_p.sum(dim=tuple(range(term_p.ndim - 1))).real if term_p.ndim > 1 else term_p.real
+
+                            C_col = col._get_effective_crosstalk_matrix(device=grad_t_vec.device, dtype=grad_t_vec.dtype)
+                            if C_col is not None:
+                                grad_t_vec = torch.mv(C_col.T, grad_t_vec)
+                                grad_p_vec = torch.mv(C_col.T, grad_p_vec)
 
                             for k, c in enumerate(col.components):
                                 param_grad_map[id(c.theta)] = grad_t_vec[k].to(device=c.theta.device, dtype=c.theta.dtype).reshape_as(c.theta)
@@ -329,12 +358,10 @@ class AdjointStrategy(BackwardStrategy):
 
             if is_full_mzm_array:
                 N = optical_layer.columnlayers[0].N
-                thetas = [
-                    ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                theta_mat = torch.stack([
+                    col._get_effective_phases().to(device=device)
                     for col in optical_layer.columnlayers
-                    for c in col.components
-                ]
-                theta_mat = torch.cat(thetas).view(L, N)
+                ], dim=0)
                 dT_dtheta = (0.5j * torch.exp(1j * theta_mat)).to(dtype=internal_dtype)
 
                 x_flat = input_tensor.reshape(-1, N)
@@ -343,6 +370,9 @@ class AdjointStrategy(BackwardStrategy):
 
                 for i, col in enumerate(optical_layer.columnlayers):
                     row_grads = grad_theta_mat[i]
+                    C_i = col._get_effective_crosstalk_matrix(device=row_grads.device, dtype=row_grads.dtype)
+                    if C_i is not None:
+                        row_grads = torch.mv(C_i.T, row_grads)
                     for m, c in enumerate(col.components):
                         gt = row_grads[m]
                         if gt.device != c.theta.device or gt.dtype != c.theta.dtype:
@@ -373,14 +403,9 @@ class AdjointStrategy(BackwardStrategy):
                             if n_idx.device != device:
                                 n_idx = n_idx.to(device)
 
-                        thetas = torch.cat([
-                            ((c.theta + c.phase_noise_theta) if (not column.training or c.noise_aware_training) else c.theta).view(1)
-                            for c in column.components
-                        ])
-                        phis = torch.cat([
-                            ((c.phi + c.phase_noise_phi) if (not column.training or c.noise_aware_training) else c.phi).view(1)
-                            for c in column.components
-                        ])
+                        thetas, phis = column._get_effective_phases()
+                        thetas = thetas.to(device=device)
+                        phis = phis.to(device=device)
 
                         a_m = A_fwd[..., m_idx]
                         a_n = A_fwd[..., n_idx]
@@ -408,6 +433,11 @@ class AdjointStrategy(BackwardStrategy):
                         else:
                             grad_phi_vec = term_phi.real
 
+                        C_col = column._get_effective_crosstalk_matrix(device=grad_theta_vec.device, dtype=grad_theta_vec.dtype)
+                        if C_col is not None:
+                            grad_theta_vec = torch.mv(C_col.T, grad_theta_vec)
+                            grad_phi_vec = torch.mv(C_col.T, grad_phi_vec)
+
                         for k, component in enumerate(column.components):
                             gt = grad_theta_vec[k]
                             if gt.device != component.theta.device or gt.dtype != component.theta.dtype:
@@ -430,10 +460,7 @@ class AdjointStrategy(BackwardStrategy):
                         elif m_idx.device != device:
                             m_idx = m_idx.to(device)
 
-                        thetas = torch.cat([
-                            ((c.theta + c.phase_noise_theta) if (not column.training or c.noise_aware_training) else c.theta).view(1)
-                            for c in column.components
-                        ])
+                        thetas = column._get_effective_phases().to(device=device)
                         a_m = A_fwd[..., m_idx]
                         adj_m = adjoint_field[..., i].unsqueeze(-1) if is_array_core else adjoint_field[..., m_idx]
 
@@ -444,6 +471,10 @@ class AdjointStrategy(BackwardStrategy):
                             grad_theta_vec = term_theta.sum(dim=tuple(range(term_theta.ndim - 1))).real
                         else:
                             grad_theta_vec = term_theta.real
+
+                        C_col = column._get_effective_crosstalk_matrix(device=grad_theta_vec.device, dtype=grad_theta_vec.dtype)
+                        if C_col is not None:
+                            grad_theta_vec = torch.mv(C_col.T, grad_theta_vec)
 
                         for k, component in enumerate(column.components):
                             gt = grad_theta_vec[k]
@@ -460,10 +491,7 @@ class AdjointStrategy(BackwardStrategy):
                         elif m_idx.device != device:
                             m_idx = m_idx.to(device)
 
-                        phis = torch.cat([
-                            ((c.phi + c.phase_noise_phi) if (not column.training or c.noise_aware_training) else c.phi).view(1)
-                            for c in column.components
-                        ])
+                        phis = column._get_effective_phases().to(device=device)
                         a_m = A_fwd[..., m_idx]
                         adj_m = adjoint_field[..., i].unsqueeze(-1) if is_array_core else adjoint_field[..., m_idx]
 
@@ -474,6 +502,10 @@ class AdjointStrategy(BackwardStrategy):
                             grad_phi_vec = term_phi.sum(dim=tuple(range(term_phi.ndim - 1))).real
                         else:
                             grad_phi_vec = term_phi.real
+
+                        C_col = column._get_effective_crosstalk_matrix(device=grad_phi_vec.device, dtype=grad_phi_vec.dtype)
+                        if C_col is not None:
+                            grad_phi_vec = torch.mv(C_col.T, grad_phi_vec)
 
                         for k, component in enumerate(column.components):
                             gp = grad_phi_vec[k]

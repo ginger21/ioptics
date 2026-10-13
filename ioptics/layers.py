@@ -17,14 +17,35 @@ class ForwardMode(Enum):
     FIELD_PROP = "field_prop"
 
 class ColumnLayer(torch.nn.Module):
-    def __init__(self, N:int, components:List[OpticalComponent]):
+    def __init__(
+        self,
+        N: int,
+        components: List[OpticalComponent],
+        thermal_crosstalk_coeff: float = 0.0,
+        crosstalk_matrix: Optional[torch.Tensor] = None,
+    ):
         super().__init__()
+        if thermal_crosstalk_coeff < 0.0 or thermal_crosstalk_coeff >= 1.0:
+            raise ValueError(
+                f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {thermal_crosstalk_coeff}"
+            )
         self.N = N  # number of input waveguides
         for component in components:
             for port in component.ports:
                 if port < 0 or port >= N:
                     raise ValueError(f"Port index {port} out of range [0, {N})")
         self.components = torch.nn.ModuleList(components)
+        self.thermal_crosstalk_coeff: float = float(thermal_crosstalk_coeff)
+        self._sim_crosstalk_coeff_override: Optional[float] = None
+        self._sim_override_matrix_cache: Optional[Tuple[float, Optional[torch.Tensor]]] = None
+        self._has_custom_crosstalk_matrix: bool = False
+        self._crosstalk_version: int = 0
+        self.register_buffer("_crosstalk_matrix", None, persistent=False)
+        if crosstalk_matrix is not None:
+            self.set_thermal_crosstalk_matrix(crosstalk_matrix)
+        elif self.thermal_crosstalk_coeff > 0.0:
+            self._crosstalk_matrix = self._build_crosstalk_matrix(self.thermal_crosstalk_coeff)
+
         self.cache_enabled: bool = True
         self._col_params: Optional[Tuple[torch.Tensor, ...]] = None
         self._col_any_requires_grad: bool = False
@@ -36,6 +57,107 @@ class ColumnLayer(torch.nn.Module):
         self._base_col_sig: Optional[tuple] = None
         self._base_col_has_grad: bool = False
 
+    def _build_crosstalk_matrix(self, coeff: float) -> Optional[torch.Tensor]:
+        K = len(self.components)
+        if K <= 1 or coeff <= 0.0:
+            return None
+        ref_param = next(self.parameters(), None)
+        device = ref_param.device if ref_param is not None else torch.device("cpu")
+        dtype = ref_param.dtype if (ref_param is not None and ref_param.is_floating_point()) else torch.float32
+        positions = torch.tensor(
+            [float(c.ports[0]) / float(max(1, c.dof)) for c in self.components],
+            dtype=dtype,
+            device=device,
+        )
+        dist = torch.abs(positions.unsqueeze(0) - positions.unsqueeze(1))
+        mat = torch.pow(torch.tensor(float(coeff), dtype=dtype, device=device), dist)
+        mat.fill_diagonal_(1.0)
+        return mat
+
+    def set_thermal_crosstalk_matrix(self, matrix: Optional[torch.Tensor]) -> None:
+        K = len(self.components)
+        if matrix is None:
+            self._has_custom_crosstalk_matrix = False
+            self._crosstalk_matrix = (
+                self._build_crosstalk_matrix(self.thermal_crosstalk_coeff)
+                if self.thermal_crosstalk_coeff > 0.0
+                else None
+            )
+        else:
+            if not isinstance(matrix, torch.Tensor):
+                matrix = torch.as_tensor(matrix, dtype=torch.float32)
+            if matrix.ndim != 2 or matrix.shape != (K, K):
+                raise ValueError(
+                    f"crosstalk_matrix must have shape ({K}, {K}), got {tuple(matrix.shape)}"
+                )
+            if torch.is_complex(matrix):
+                raise ValueError("crosstalk_matrix must be real-valued")
+            ref_param = next(self.parameters(), None)
+            device = ref_param.device if ref_param is not None else matrix.device
+            dtype = ref_param.dtype if (ref_param is not None and ref_param.is_floating_point()) else torch.float32
+            self._has_custom_crosstalk_matrix = True
+            self._crosstalk_matrix = matrix.detach().clone().to(device=device, dtype=dtype)
+        self._crosstalk_version += 1
+        self.invalidate_cache()
+
+    def set_thermal_crosstalk_coeff(self, coeff: float) -> None:
+        if coeff < 0.0 or coeff >= 1.0:
+            raise ValueError(f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {coeff}")
+        self.thermal_crosstalk_coeff = float(coeff)
+        if not self._has_custom_crosstalk_matrix:
+            self._crosstalk_matrix = (
+                self._build_crosstalk_matrix(self.thermal_crosstalk_coeff)
+                if self.thermal_crosstalk_coeff > 0.0
+                else None
+            )
+        self._crosstalk_version += 1
+        self.invalidate_cache()
+
+    def get_thermal_crosstalk_matrix(self) -> Optional[torch.Tensor]:
+        return self._get_effective_crosstalk_matrix()
+
+    def _has_effective_crosstalk(self) -> bool:
+        if self._sim_crosstalk_coeff_override is not None:
+            if self._sim_crosstalk_coeff_override <= 0.0:
+                return False
+            if self._has_custom_crosstalk_matrix:
+                return self._crosstalk_matrix is not None
+            return len(self.components) > 1
+        return self._crosstalk_matrix is not None
+
+    def _get_effective_crosstalk_matrix(
+        self,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Optional[torch.Tensor]:
+        mat: Optional[torch.Tensor] = None
+        if self._sim_crosstalk_coeff_override is not None:
+            override_val = self._sim_crosstalk_coeff_override
+            if override_val <= 0.0:
+                mat = None
+            elif self._has_custom_crosstalk_matrix:
+                mat = self._crosstalk_matrix
+            elif override_val == self.thermal_crosstalk_coeff and self._crosstalk_matrix is not None:
+                mat = self._crosstalk_matrix
+            else:
+                if (
+                    self._sim_override_matrix_cache is None
+                    or self._sim_override_matrix_cache[0] != override_val
+                ):
+                    self._sim_override_matrix_cache = (
+                        override_val,
+                        self._build_crosstalk_matrix(override_val),
+                    )
+                mat = self._sim_override_matrix_cache[1]
+        else:
+            mat = self._crosstalk_matrix
+
+        if mat is None:
+            return None
+        if (device is not None and mat.device != device) or (dtype is not None and mat.dtype != dtype):
+            mat = mat.to(device=device or mat.device, dtype=dtype or mat.dtype)
+        return mat
+
     def _init_col_cache_tracking(self) -> None:
         params = tuple(self.parameters())
         self._col_params = params
@@ -46,17 +168,21 @@ class ColumnLayer(torch.nn.Module):
             self._init_col_cache_tracking()
         params = self._col_params
         if not params:
-            return (self.training,)
+            return (self.training, self._crosstalk_version, self._sim_crosstalk_coeff_override)
         p0 = params[0]
         if p0.is_cpu:
             return (
                 self.training,
+                self._crosstalk_version,
+                self._sim_crosstalk_coeff_override,
                 p0.data_ptr(),
                 params[-1].data_ptr(),
                 tuple(map(_get_tensor_item, params)),
             )
         return (
             self.training,
+            self._crosstalk_version,
+            self._sim_crosstalk_coeff_override,
             p0.data_ptr(),
             params[-1].data_ptr(),
             tuple(map(_get_tensor_version, params)),
@@ -142,8 +268,19 @@ class ColumnLayer(torch.nn.Module):
 
 class MeshColumn(ColumnLayer):
     '''class for physical column of optical components.'''
-    def __init__(self, N:int, components:List[OpticalComponent]):
-        super().__init__(N, components)
+    def __init__(
+        self,
+        N: int,
+        components: List[OpticalComponent],
+        thermal_crosstalk_coeff: float = 0.0,
+        crosstalk_matrix: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(
+            N,
+            components,
+            thermal_crosstalk_coeff=thermal_crosstalk_coeff,
+            crosstalk_matrix=crosstalk_matrix,
+        )
         self._all_mzi = len(self.components) > 0 and all(isinstance(c, MZI) for c in self.components)
         if self._all_mzi:
             m_list = [c.m for c in self.components]
@@ -164,26 +301,36 @@ class MeshColumn(ColumnLayer):
             self._mzi_scatter_idx = None
             self._base_eye_flat = None
 
+    def _get_effective_phases(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        theta_vec = torch.cat([c.theta.view(1) for c in self.components])
+        phi_vec = torch.cat([c.phi.view(1) for c in self.components])
+        C = self._get_effective_crosstalk_matrix(device=theta_vec.device, dtype=theta_vec.dtype)
+        if C is not None:
+            theta_vec = torch.mv(C, theta_vec)
+            phi_vec = torch.mv(C, phi_vec)
+        if any(not self.training or c.noise_aware_training for c in self.components):
+            theta_noise = torch.cat([
+                c.phase_noise_theta.view(1)
+                if (not self.training or c.noise_aware_training)
+                else torch.zeros(1, dtype=theta_vec.dtype, device=theta_vec.device)
+                for c in self.components
+            ])
+            phi_noise = torch.cat([
+                c.phase_noise_phi.view(1)
+                if (not self.training or c.noise_aware_training)
+                else torch.zeros(1, dtype=phi_vec.dtype, device=phi_vec.device)
+                for c in self.components
+            ])
+            theta_vec = theta_vec + theta_noise
+            phi_vec = phi_vec + phi_noise
+        return theta_vec, phi_vec
+
     def _compute_transfer_matrix(self) -> torch.Tensor:
         if len(self.components) == 0:
             return torch.eye(self.N, dtype=torch.complex64)
 
         if self._all_mzi:
-            thetas = [
-                (c.theta + c.phase_noise_theta).view(1)
-                if (not self.training or c.noise_aware_training)
-                else c.theta.view(1)
-                for c in self.components
-            ]
-            phis = [
-                (c.phi + c.phase_noise_phi).view(1)
-                if (not self.training or c.noise_aware_training)
-                else c.phi.view(1)
-                for c in self.components
-            ]
-
-            theta_vec = torch.cat(thetas)
-            phi_vec = torch.cat(phis)
+            theta_vec, phi_vec = self._get_effective_phases()
 
             exp_jphi = torch.exp(1j * phi_vec)
             exp_jtheta = torch.exp(1j * theta_vec)
@@ -237,8 +384,19 @@ class ArrayColumn(ColumnLayer):
     In the weight-matrix view (L x N), each ArrayColumn produces one row of the
     weight matrix. L (number of columns/outputs) may differ from N (inputs).
     """
-    def __init__(self, N:int, components:List[OpticalComponent]):
-        super().__init__(N, components)
+    def __init__(
+        self,
+        N: int,
+        components: List[OpticalComponent],
+        thermal_crosstalk_coeff: float = 0.0,
+        crosstalk_matrix: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(
+            N,
+            components,
+            thermal_crosstalk_coeff=thermal_crosstalk_coeff,
+            crosstalk_matrix=crosstalk_matrix,
+        )
         self._all_mzm = len(self.components) > 0 and all(isinstance(c, MZM) for c in self.components)
         self._all_ps = len(self.components) > 0 and all(isinstance(c, PhaseShifter) for c in self.components)
         if self._all_mzm or self._all_ps:
@@ -251,19 +409,44 @@ class ArrayColumn(ColumnLayer):
             self._is_contiguous_full = False
             self._comp_m_idx = None
 
+    def _get_effective_phases(self) -> torch.Tensor:
+        if self._all_mzm:
+            phase_vec = torch.cat([c.theta.view(1) for c in self.components])
+            C = self._get_effective_crosstalk_matrix(device=phase_vec.device, dtype=phase_vec.dtype)
+            if C is not None:
+                phase_vec = torch.mv(C, phase_vec)
+            if any(not self.training or c.noise_aware_training for c in self.components):
+                noise_vec = torch.cat([
+                    c.phase_noise_theta.view(1)
+                    if (not self.training or c.noise_aware_training)
+                    else torch.zeros(1, dtype=phase_vec.dtype, device=phase_vec.device)
+                    for c in self.components
+                ])
+                phase_vec = phase_vec + noise_vec
+            return phase_vec
+        if self._all_ps:
+            phase_vec = torch.cat([c.phi.view(1) for c in self.components])
+            C = self._get_effective_crosstalk_matrix(device=phase_vec.device, dtype=phase_vec.dtype)
+            if C is not None:
+                phase_vec = torch.mv(C, phase_vec)
+            if any(not self.training or c.noise_aware_training for c in self.components):
+                noise_vec = torch.cat([
+                    c.phase_noise_phi.view(1)
+                    if (not self.training or c.noise_aware_training)
+                    else torch.zeros(1, dtype=phase_vec.dtype, device=phase_vec.device)
+                    for c in self.components
+                ])
+                phase_vec = phase_vec + noise_vec
+            return phase_vec
+        raise RuntimeError("_get_effective_phases requires all MZM or all PhaseShifter components")
+
     def _compute_transfer_matrix(self) -> torch.Tensor:
         # Returns a 1D tensor of shape (N,) representing one row of the weight matrix
         if len(self.components) == 0:
             return torch.zeros(self.N, dtype=torch.complex64)
 
         if self._all_mzm:
-            thetas = [
-                (c.theta + c.phase_noise_theta).view(1)
-                if (not self.training or c.noise_aware_training)
-                else c.theta.view(1)
-                for c in self.components
-            ]
-            theta_vec = torch.cat(thetas)
+            theta_vec = self._get_effective_phases()
             vals = 0.5 * (torch.exp(1j * theta_vec) + 1.0)
             if self._is_contiguous_full:
                 return vals
@@ -271,13 +454,7 @@ class ArrayColumn(ColumnLayer):
             return torch.zeros(self.N, dtype=vals.dtype, device=vals.device).scatter(0, idx, vals)
 
         if self._all_ps:
-            phis = [
-                (c.phi + c.phase_noise_phi).view(1)
-                if (not self.training or c.noise_aware_training)
-                else c.phi.view(1)
-                for c in self.components
-            ]
-            phi_vec = torch.cat(phis)
+            phi_vec = self._get_effective_phases()
             vals = torch.exp(1j * phi_vec)
             if self._is_contiguous_full:
                 return vals
@@ -305,21 +482,29 @@ class ArrayColumn(ColumnLayer):
 class CoreLayer(torch.nn.Module):
     def __init__(
         self,
-        L:int,
-        columnlayers:List[ColumnLayer],
-        output_ports:Optional[slice] = None,
+        L: int,
+        columnlayers: List[ColumnLayer],
+        output_ports: Optional[slice] = None,
         backward_type: str = BackwardType.DEFAULT.value,
         forward_mode: str = ForwardMode.MATRIX.value,
         insertion_loss_db: float = 0.0,
+        thermal_crosstalk_coeff: float = 0.0,
     ):
         super().__init__()
         if insertion_loss_db < 0.0:
             raise ValueError(f"insertion_loss_db must be non-negative, got {insertion_loss_db}")
+        if thermal_crosstalk_coeff < 0.0 or thermal_crosstalk_coeff >= 1.0:
+            raise ValueError(
+                f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {thermal_crosstalk_coeff}"
+            )
         self.L = L
         self.output_ports = self._normalize_output_ports(output_ports, L)
         self.insertion_loss_db: float = float(insertion_loss_db)
+        self.thermal_crosstalk_coeff: float = float(thermal_crosstalk_coeff)
         self._sim_loss_db_override: Optional[float] = None
+        self._sim_crosstalk_coeff_override: Optional[float] = None
         self._sim_trace_collector: Optional[List[torch.Tensor]] = None
+        self._core_crosstalk_version: int = 0
 
         if backward_type not in [bt.value for bt in BackwardType]:
             raise ValueError(f"Unsupported backward_type: {backward_type}")
@@ -328,6 +513,15 @@ class CoreLayer(torch.nn.Module):
         if forward_mode not in [fm.value for fm in ForwardMode]:
             raise ValueError(f"Unsupported forward_mode: {forward_mode}")
         self.forward_mode = forward_mode
+
+        if self.thermal_crosstalk_coeff > 0.0:
+            for col in columnlayers:
+                if (
+                    isinstance(col, ColumnLayer)
+                    and col.thermal_crosstalk_coeff == 0.0
+                    and not col._has_custom_crosstalk_matrix
+                ):
+                    col.set_thermal_crosstalk_coeff(self.thermal_crosstalk_coeff)
 
         self.columnlayers = torch.nn.ModuleList(columnlayers)
         self.cache_enabled: bool = True
@@ -341,6 +535,26 @@ class CoreLayer(torch.nn.Module):
         self._base_prefix: Optional[List[Optional[torch.Tensor]]] = None
         self._base_tm: Optional[torch.Tensor] = None
         self._base_has_grad: bool = False
+
+    def set_thermal_crosstalk_coeff(self, coeff: float) -> None:
+        if coeff < 0.0 or coeff >= 1.0:
+            raise ValueError(f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {coeff}")
+        self.thermal_crosstalk_coeff = float(coeff)
+        for col in self.columnlayers:
+            if isinstance(col, ColumnLayer):
+                col.set_thermal_crosstalk_coeff(self.thermal_crosstalk_coeff)
+        self._core_crosstalk_version += 1
+        self.invalidate_cache()
+
+    def _set_sim_crosstalk_override(self, coeff: Optional[float]) -> None:
+        if self._sim_crosstalk_coeff_override == coeff:
+            return
+        self._sim_crosstalk_coeff_override = coeff
+        for col in self.columnlayers:
+            if isinstance(col, ColumnLayer):
+                col._sim_crosstalk_coeff_override = coeff
+        self._core_crosstalk_version += 1
+        self.invalidate_cache()
 
     def _effective_loss_db(self) -> float:
         if self._sim_loss_db_override is not None:
@@ -361,14 +575,26 @@ class CoreLayer(torch.nn.Module):
         if self._cache_all_params is None:
             self._init_cache_tracking()
         all_params = self._cache_all_params
+        col_ct_versions = tuple(
+            getattr(col, "_crosstalk_version", 0) for col in self.columnlayers
+        )
         if not all_params:
-            return (self.training, get_global_param_epoch())
+            return (
+                self.training,
+                get_global_param_epoch(),
+                self._core_crosstalk_version,
+                self._sim_crosstalk_coeff_override,
+                col_ct_versions,
+            )
         tracked = all_params if self.training else self._cache_eval_params
         p0 = all_params[0]
         p_last = all_params[-1]
         return (
             self.training,
             get_global_param_epoch(),
+            self._core_crosstalk_version,
+            self._sim_crosstalk_coeff_override,
+            col_ct_versions,
             p0.data_ptr(),
             p_last.data_ptr(),
             tuple(map(_get_tensor_version, tracked)),
@@ -520,12 +746,13 @@ class MeshCore(CoreLayer):
     '''class for physical mesh of optical columnlayers.'''
     def __init__(
         self,
-        L:int,
-        columnlayers:List[ColumnLayer],
-        output_ports:Optional[slice] = None,
+        L: int,
+        columnlayers: List[ColumnLayer],
+        output_ports: Optional[slice] = None,
         backward_type: str = BackwardType.DEFAULT.value,
         forward_mode: str = ForwardMode.MATRIX.value,
         insertion_loss_db: float = 0.0,
+        thermal_crosstalk_coeff: float = 0.0,
     ):
         super().__init__(
             L,
@@ -534,6 +761,7 @@ class MeshCore(CoreLayer):
             backward_type,
             forward_mode,
             insertion_loss_db=insertion_loss_db,
+            thermal_crosstalk_coeff=thermal_crosstalk_coeff,
         )
 
     def _field_prop_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -707,14 +935,9 @@ class MeshCore(CoreLayer):
                 ):
                     m_idx = col._mzi_m_idx if col._mzi_m_idx.device == device else col._mzi_m_idx.to(device)
                     n_idx = col._mzi_n_idx if col._mzi_n_idx.device == device else col._mzi_n_idx.to(device)
-                    thetas = torch.cat([
-                        ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
-                        for c in col.components
-                    ])
-                    phis = torch.cat([
-                        ((c.phi + c.phase_noise_phi) if (not col.training or c.noise_aware_training) else c.phi).view(1)
-                        for c in col.components
-                    ])
+                    thetas, phis = col._get_effective_phases()
+                    thetas = thetas.to(device=device)
+                    phis = phis.to(device=device)
                     for c in col.components:
                         param_list.append(c.theta)
                         param_list.append(c.phi)
@@ -726,25 +949,51 @@ class MeshCore(CoreLayer):
                     y_m = 0.5 * e_iphi * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n)
                     y_n = 0.5j * (e_itheta + 1.0) * a_m + 0.5 * (1.0 - e_itheta) * a_n
 
-                    e_it_p = torch.exp(1j * (thetas + shift)).to(dtype=internal_dtype)
-                    e_it_m = torch.exp(1j * (thetas - shift)).to(dtype=internal_dtype)
-                    dym_tp = 0.5 * e_iphi * ((e_it_p - 1.0) * a_m + 1j * (1.0 + e_it_p) * a_n) - y_m
-                    dyn_tp = (0.5j * (e_it_p + 1.0) * a_m + 0.5 * (1.0 - e_it_p) * a_n) - y_n
-                    dym_tm = 0.5 * e_iphi * ((e_it_m - 1.0) * a_m + 1j * (1.0 + e_it_m) * a_n) - y_m
-                    dyn_tm = (0.5j * (e_it_m + 1.0) * a_m + 0.5 * (1.0 - e_it_m) * a_n) - y_n
-
-                    e_ip_p = torch.exp(1j * (phis + shift)).to(dtype=internal_dtype)
-                    e_ip_m = torch.exp(1j * (phis - shift)).to(dtype=internal_dtype)
-                    dym_pp = 0.5 * e_ip_p * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n) - y_m
-                    dym_pm = 0.5 * e_ip_m * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n) - y_m
-
                     S_m = S_i[:, m_idx].T  # (K, L)
                     S_n = S_i[:, n_idx].T  # (K, L)
+                    C = col._get_effective_crosstalk_matrix(device=device, dtype=thetas.dtype)
 
-                    dt_plus = dym_tp.unsqueeze(-1) * S_m + dyn_tp.unsqueeze(-1) * S_n
-                    dt_minus = dym_tm.unsqueeze(-1) * S_m + dyn_tm.unsqueeze(-1) * S_n
-                    dp_plus = dym_pp.unsqueeze(-1) * S_m
-                    dp_minus = dym_pm.unsqueeze(-1) * S_m
+                    if C is None:
+                        e_it_p = torch.exp(1j * (thetas + shift)).to(dtype=internal_dtype)
+                        e_it_m = torch.exp(1j * (thetas - shift)).to(dtype=internal_dtype)
+                        dym_tp = 0.5 * e_iphi * ((e_it_p - 1.0) * a_m + 1j * (1.0 + e_it_p) * a_n) - y_m
+                        dyn_tp = (0.5j * (e_it_p + 1.0) * a_m + 0.5 * (1.0 - e_it_p) * a_n) - y_n
+                        dym_tm = 0.5 * e_iphi * ((e_it_m - 1.0) * a_m + 1j * (1.0 + e_it_m) * a_n) - y_m
+                        dyn_tm = (0.5j * (e_it_m + 1.0) * a_m + 0.5 * (1.0 - e_it_m) * a_n) - y_n
+
+                        e_ip_p = torch.exp(1j * (phis + shift)).to(dtype=internal_dtype)
+                        e_ip_m = torch.exp(1j * (phis - shift)).to(dtype=internal_dtype)
+                        dym_pp = 0.5 * e_ip_p * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n) - y_m
+                        dym_pm = 0.5 * e_ip_m * ((e_itheta - 1.0) * a_m + 1j * (1.0 + e_itheta) * a_n) - y_m
+
+                        dt_plus = dym_tp.unsqueeze(-1) * S_m + dyn_tp.unsqueeze(-1) * S_n
+                        dt_minus = dym_tm.unsqueeze(-1) * S_m + dyn_tm.unsqueeze(-1) * S_n
+                        dp_plus = dym_pp.unsqueeze(-1) * S_m
+                        dp_minus = dym_pm.unsqueeze(-1) * S_m
+                    else:
+                        # Row r has shift applied to nominal parameter r: delta_eff = +/- shift * C[:, r]
+                        delta_c = shift * C.T  # (K_param, K_mzi)
+                        e_it_p = torch.exp(1j * (thetas.unsqueeze(0) + delta_c)).to(dtype=internal_dtype)
+                        e_it_m = torch.exp(1j * (thetas.unsqueeze(0) - delta_c)).to(dtype=internal_dtype)
+                        a_m_exp = a_m.unsqueeze(-2)
+                        a_n_exp = a_n.unsqueeze(-2)
+                        y_m_exp = y_m.unsqueeze(-2)
+                        y_n_exp = y_n.unsqueeze(-2)
+
+                        dym_tp = 0.5 * e_iphi * ((e_it_p - 1.0) * a_m_exp + 1j * (1.0 + e_it_p) * a_n_exp) - y_m_exp
+                        dyn_tp = (0.5j * (e_it_p + 1.0) * a_m_exp + 0.5 * (1.0 - e_it_p) * a_n_exp) - y_n_exp
+                        dym_tm = 0.5 * e_iphi * ((e_it_m - 1.0) * a_m_exp + 1j * (1.0 + e_it_m) * a_n_exp) - y_m_exp
+                        dyn_tm = (0.5j * (e_it_m + 1.0) * a_m_exp + 0.5 * (1.0 - e_it_m) * a_n_exp) - y_n_exp
+
+                        e_ip_p = torch.exp(1j * (phis.unsqueeze(0) + delta_c)).to(dtype=internal_dtype)
+                        e_ip_m = torch.exp(1j * (phis.unsqueeze(0) - delta_c)).to(dtype=internal_dtype)
+                        dym_pp = 0.5 * e_ip_p * ((e_itheta - 1.0) * a_m_exp + 1j * (1.0 + e_itheta) * a_n_exp) - y_m_exp
+                        dym_pm = 0.5 * e_ip_m * ((e_itheta - 1.0) * a_m_exp + 1j * (1.0 + e_itheta) * a_n_exp) - y_m_exp
+
+                        dt_plus = torch.matmul(dym_tp, S_m) + torch.matmul(dyn_tp, S_n)
+                        dt_minus = torch.matmul(dym_tm, S_m) + torch.matmul(dyn_tm, S_n)
+                        dp_plus = torch.matmul(dym_pp, S_m)
+                        dp_minus = torch.matmul(dym_pm, S_m)
 
                     lead_shape = inp_c.shape[:-1]
                     plus_chunks.append(torch.stack([dt_plus, dp_plus], dim=-2).reshape(*lead_shape, -1, L))
@@ -771,16 +1020,21 @@ class MeshCore(CoreLayer):
 class ClementsMesh(MeshCore):
     def __init__(
         self,
-        L:int,
+        L: int,
         output_ports: Optional[slice] = None,
         phase_noise_std: float = 0.0,
         noise_aware_training: bool = False,
         backward_type: str = BackwardType.DEFAULT.value,
         forward_mode: str = ForwardMode.MATRIX.value,
         insertion_loss_db: float = 0.0,
+        thermal_crosstalk_coeff: float = 0.0,
     ):
         if L <= 0:
             raise ValueError(f"L must be positive, got {L}")
+        if thermal_crosstalk_coeff < 0.0 or thermal_crosstalk_coeff >= 1.0:
+            raise ValueError(
+                f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {thermal_crosstalk_coeff}"
+            )
 
         self.phase_noise_std = phase_noise_std
         self.noise_aware_training = noise_aware_training
@@ -788,14 +1042,30 @@ class ClementsMesh(MeshCore):
         for layer_index in range(L):
             if L % 2 == 0:  # even number of waveguides
                 if layer_index % 2 == 0:
-                    columnlayer = MeshColumn(L, [MZI(m, m+1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(0, L, 2)])
+                    columnlayer = MeshColumn(
+                        L,
+                        [MZI(m, m + 1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(0, L, 2)],
+                        thermal_crosstalk_coeff=thermal_crosstalk_coeff,
+                    )
                 else:
-                    columnlayer = MeshColumn(L, [MZI(m, m+1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(1, L-1, 2)])
+                    columnlayer = MeshColumn(
+                        L,
+                        [MZI(m, m + 1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(1, L - 1, 2)],
+                        thermal_crosstalk_coeff=thermal_crosstalk_coeff,
+                    )
             else:  # odd number of waveguides
                 if layer_index % 2 == 0:
-                    columnlayer = MeshColumn(L, [MZI(m, m+1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(0, L-1, 2)])
+                    columnlayer = MeshColumn(
+                        L,
+                        [MZI(m, m + 1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(0, L - 1, 2)],
+                        thermal_crosstalk_coeff=thermal_crosstalk_coeff,
+                    )
                 else:
-                    columnlayer = MeshColumn(L, [MZI(m, m+1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(1, L, 2)])
+                    columnlayer = MeshColumn(
+                        L,
+                        [MZI(m, m + 1, phase_noise_std=phase_noise_std, noise_aware_training=noise_aware_training) for m in range(1, L, 2)],
+                        thermal_crosstalk_coeff=thermal_crosstalk_coeff,
+                    )
             columnlayer_list.append(columnlayer)
         super().__init__(
             L,
@@ -804,6 +1074,7 @@ class ClementsMesh(MeshCore):
             backward_type=backward_type,
             forward_mode=forward_mode,
             insertion_loss_db=insertion_loss_db,
+            thermal_crosstalk_coeff=thermal_crosstalk_coeff,
         )
 
     def extra_repr(self):
@@ -818,11 +1089,12 @@ class ArrayCore(CoreLayer):
     """
     def __init__(
         self,
-        L:int,
-        columnlayers:List[ColumnLayer],
-        output_ports:Optional[slice] = None,
+        L: int,
+        columnlayers: List[ColumnLayer],
+        output_ports: Optional[slice] = None,
         backward_type: str = BackwardType.DEFAULT.value,
         insertion_loss_db: float = 0.0,
+        thermal_crosstalk_coeff: float = 0.0,
     ):
         super().__init__(
             L,
@@ -830,6 +1102,7 @@ class ArrayCore(CoreLayer):
             output_ports,
             backward_type,
             insertion_loss_db=insertion_loss_db,
+            thermal_crosstalk_coeff=thermal_crosstalk_coeff,
         )
 
     def extra_repr(self):
@@ -868,7 +1141,9 @@ class ArrayCore(CoreLayer):
             return tm
 
         if all(
-            getattr(col, "_all_mzm", False) and getattr(col, "_is_contiguous_full", False)
+            getattr(col, "_all_mzm", False)
+            and getattr(col, "_is_contiguous_full", False)
+            and not col._has_effective_crosstalk()
             for col in self.columnlayers
         ):
             thetas = [
@@ -921,18 +1196,45 @@ class ArrayCore(CoreLayer):
         N = self.columnlayers[0].N
         with torch.no_grad():
             param_list = [c.theta for col in self.columnlayers for c in col.components]
-            thetas = torch.cat([
-                ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
-                for col in self.columnlayers
-                for c in col.components
-            ]).view(L, N)
-            t_base = (0.5 * (torch.exp(1j * thetas) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
-            t_plus = (0.5 * (torch.exp(1j * (thetas + shift)) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
-            t_minus = (0.5 * (torch.exp(1j * (thetas - shift)) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
+            any_crosstalk = any(col._has_effective_crosstalk() for col in self.columnlayers)
+            if not any_crosstalk:
+                thetas = torch.cat([
+                    ((c.theta + c.phase_noise_theta) if (not col.training or c.noise_aware_training) else c.theta).view(1)
+                    for col in self.columnlayers
+                    for c in col.components
+                ]).view(L, N)
+                t_base = (0.5 * (torch.exp(1j * thetas) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
+                t_plus = (0.5 * (torch.exp(1j * (thetas + shift)) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
+                t_minus = (0.5 * (torch.exp(1j * (thetas - shift)) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
 
-            full_base = F.linear(inp_c, t_base)  # (..., L)
-            delta_p = (t_plus - t_base) * inp_c.unsqueeze(-2)  # (..., L, N)
-            delta_m = (t_minus - t_base) * inp_c.unsqueeze(-2)  # (..., L, N)
+                full_base = F.linear(inp_c, t_base)  # (..., L)
+                delta_p = (t_plus - t_base) * inp_c.unsqueeze(-2)  # (..., L, N)
+                delta_m = (t_minus - t_base) * inp_c.unsqueeze(-2)  # (..., L, N)
+            else:
+                eff_rows = [col._get_effective_phases().to(device=inp_c.device) for col in self.columnlayers]
+                thetas = torch.stack(eff_rows, dim=0)  # (L, N)
+                t_base = (0.5 * (torch.exp(1j * thetas) + 1.0)).to(device=inp_c.device, dtype=internal_dtype)
+                full_base = F.linear(inp_c, t_base)  # (..., L)
+                delta_p_rows = []
+                delta_m_rows = []
+                for i_col, col in enumerate(self.columnlayers):
+                    th_i = eff_rows[i_col]  # (N,)
+                    tb_i = t_base[i_col]    # (N,)
+                    C_i = col._get_effective_crosstalk_matrix(device=inp_c.device, dtype=th_i.dtype)
+                    if C_i is None:
+                        tp_i = (0.5 * (torch.exp(1j * (th_i + shift)) + 1.0)).to(dtype=internal_dtype)
+                        tm_i = (0.5 * (torch.exp(1j * (th_i - shift)) + 1.0)).to(dtype=internal_dtype)
+                        delta_p_rows.append((tp_i - tb_i) * inp_c)
+                        delta_m_rows.append((tm_i - tb_i) * inp_c)
+                    else:
+                        # (N_param, N_mzm)
+                        delta_c = shift * C_i.T
+                        tp_mat = (0.5 * (torch.exp(1j * (th_i.unsqueeze(0) + delta_c)) + 1.0)).to(dtype=internal_dtype)
+                        tm_mat = (0.5 * (torch.exp(1j * (th_i.unsqueeze(0) - delta_c)) + 1.0)).to(dtype=internal_dtype)
+                        delta_p_rows.append(F.linear(inp_c, tp_mat - tb_i.unsqueeze(0)))
+                        delta_m_rows.append(F.linear(inp_c, tm_mat - tb_i.unsqueeze(0)))
+                delta_p = torch.stack(delta_p_rows, dim=-2)  # (..., L, N)
+                delta_m = torch.stack(delta_m_rows, dim=-2)  # (..., L, N)
 
             eye_L = torch.eye(L, dtype=internal_dtype, device=inp_c.device)  # (L, L)
             lead_shape = inp_c.shape[:-1]
@@ -958,17 +1260,22 @@ class FCArray(ArrayCore):
     """
     def __init__(
         self,
-        in_dim:int,
-        out_dim:int,
-        output_ports:Optional[slice] = None,
+        in_dim: int,
+        out_dim: int,
+        output_ports: Optional[slice] = None,
         backward_type: str = BackwardType.DEFAULT.value,
         noise_aware_training: bool = False,
         insertion_loss_db: float = 0.0,
+        thermal_crosstalk_coeff: float = 0.0,
     ):
         if in_dim <= 0:
             raise ValueError(f"in_dim must be positive, got {in_dim}")
         if out_dim <= 0:
             raise ValueError(f"out_dim must be positive, got {out_dim}")
+        if thermal_crosstalk_coeff < 0.0 or thermal_crosstalk_coeff >= 1.0:
+            raise ValueError(
+                f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {thermal_crosstalk_coeff}"
+            )
 
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -976,7 +1283,11 @@ class FCArray(ArrayCore):
         columnlayer_list = []
         # Build out_dim columns, each receiving in_dim inputs (L=out_dim, N=in_dim)
         for layer_index in range(out_dim):
-            columnlayer = ArrayColumn(in_dim, [MZM(m, noise_aware_training=noise_aware_training) for m in range(in_dim)])
+            columnlayer = ArrayColumn(
+                in_dim,
+                [MZM(m, noise_aware_training=noise_aware_training) for m in range(in_dim)],
+                thermal_crosstalk_coeff=thermal_crosstalk_coeff,
+            )
             columnlayer_list.append(columnlayer)
 
         super().__init__(
@@ -985,6 +1296,7 @@ class FCArray(ArrayCore):
             output_ports,
             backward_type,
             insertion_loss_db=insertion_loss_db,
+            thermal_crosstalk_coeff=thermal_crosstalk_coeff,
         )
 
     def extra_repr(self):

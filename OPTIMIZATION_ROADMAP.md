@@ -280,8 +280,8 @@
   - 消除仿真链路 Auto-Gain 中的 `torch.max(photocurrent).item()` 调用（改为纯张量 `torch.amax` + `torch.where`）及训练批循环中的逐 Batch `.item()` 同步，避免打断 GPU 异步流水线（Pipeline Stall），确保纯显存内高速流转。
 - [x] **现代 PyTorch 编译器适配与算子融合（`torch.compile`）(Completed ✅)**：
   - 预计算 `MeshColumn` 稀疏散射索引 `_mzi_scatter_idx` 与基底单位阵 `_base_eye_flat`，将切片就地写入改为函数式非原地 `scatter` 算子，支持 `torch.compile` 图捕获与算子融合。
-- [ ] **热串扰矩阵（Thermal Crosstalk Matrix）空间物理建模**：
-  - 引入空间相邻相移器间的热扩散串扰耦合矩阵 $C \cdot \boldsymbol{\theta}$，模拟高密度集成下的片上热失真。
+- [x] **热串扰矩阵（Thermal Crosstalk Matrix）空间物理建模 (Completed ✅)**：
+  - 在 `ColumnLayer`（`MeshColumn` / `ArrayColumn`）中支持基于空间波导端口距离衰减的近邻热串扰矩阵 $C_{ij} = \alpha^{|p_i - p_j|}$ 与自定义实测矩阵注入；在有效相位 $\boldsymbol{\theta}_{\text{eff}} = C \boldsymbol{\theta} + \boldsymbol{\delta\theta}_{\text{noise}}$ 上计算中间光场与局部干涉导数，并通过链式法则 $C^\top \nabla_{\boldsymbol{\theta}_{\text{eff}}} \mathcal{L}$ 实现与 PyTorch `Autograd` 机器精度对齐；在 `SimulatorConfig` 中将 `HardwareProfile.LAB`（1%）与 `HARDWARE_LIKE`（3%）配置热串扰，并在确定性模式下自动抑制。
 
 ---
 

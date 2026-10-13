@@ -75,4 +75,4 @@
 - **参数位移法批处理并行化** [已完成]：在 `ParameterShiftStrategy`、`MeshCore`/`ArrayCore.forward_parameter_shifts` 与 `ParameterShiftDifferentiator` 中将全部参数的 $\pm\pi/2$ 扰动状态在参数批维度一次性向量化并行展开，消除逐参数串行循环；$N=8$ 耗时从 `403.2ms` 降至 **`7.56ms`**（提速 **53.3x**），$N=16$ 降至 **`22.07ms`**（提速 **59.3x**），$N=64$（4032 参数）仅需 **`394.05ms`**。
 - **消除 CPU-GPU 同步屏障** [已完成]：移除 Auto-Gain 与训练批循环热路径中的 `.item()` 调用，改为纯张量运算保持显存流水线。
 - **消除 Inplace 写入并适配 `torch.compile`** [已完成]：将转移矩阵构建中的切片原地写入改为函数式 `scatter` 算子，支持 Dynamo 图捕获与算子融合。
-- **热串扰矩阵（Thermal Crosstalk Matrix）** [待完成]：引入相邻相移器间的空间热扩散耦合矩阵。
+- **热串扰矩阵（Thermal Crosstalk Matrix）** [已完成]：在 `ColumnLayer`、`MeshColumn`、`ArrayColumn` 与 `Simulator` 中引入列内相邻相移器间的空间热扩散耦合矩阵 $C \cdot \boldsymbol{\theta}$（支持指数衰减与自定义实测矩阵），并在 `AdjointVariant`、`ParameterShift` 与 `Autograd` 中实现严格的梯度闭环。

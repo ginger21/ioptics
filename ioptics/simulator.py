@@ -116,6 +116,7 @@ class SimulatorConfig:
     auto_gain: bool = False
     normalize: bool = False
     cascaded_loss: bool = True
+    thermal_crosstalk_coeff: float = 0.0
 
     @staticmethod
     def from_profile(profile: HardwareProfile | str) -> SimulatorConfig:
@@ -127,6 +128,7 @@ class SimulatorConfig:
                 coupling_loss=0.0,
                 laser_noise=False,
                 detector_noise=False,
+                thermal_crosstalk_coeff=0.0,
             )
         if prof == HardwareProfile.LAB:
             return SimulatorConfig(
@@ -134,6 +136,7 @@ class SimulatorConfig:
                 coupling_loss=0.3,
                 laser_noise=True,
                 detector_noise=True,
+                thermal_crosstalk_coeff=0.01,
             )
         if prof == HardwareProfile.HARDWARE_LIKE:
             return SimulatorConfig(
@@ -145,6 +148,7 @@ class SimulatorConfig:
                 detector_dark_current=5e-9,
                 laser_noise=True,
                 detector_noise=True,
+                thermal_crosstalk_coeff=0.03,
             )
         raise ValueError(f"Unknown profile: {profile}")
 
@@ -222,6 +226,7 @@ class Simulator:
         auto_gain: Optional[bool] = None,
         normalize: Optional[bool] = None,
         cascaded_loss: Optional[bool] = None,
+        thermal_crosstalk_coeff: Optional[float] = None,
     ) -> None:
         # Resolve profile
         self._profile = HardwareProfile(profile)
@@ -238,8 +243,19 @@ class Simulator:
             overrides["normalize"] = normalize
         if cascaded_loss is not None:
             overrides["cascaded_loss"] = cascaded_loss
+        if thermal_crosstalk_coeff is not None:
+            if thermal_crosstalk_coeff < 0.0 or thermal_crosstalk_coeff >= 1.0:
+                raise ValueError(
+                    f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {thermal_crosstalk_coeff}"
+                )
+            overrides["thermal_crosstalk_coeff"] = float(thermal_crosstalk_coeff)
         if overrides:
             self._config = replace(self._config, **overrides)
+
+        if self._config.thermal_crosstalk_coeff < 0.0 or self._config.thermal_crosstalk_coeff >= 1.0:
+            raise ValueError(
+                f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {self._config.thermal_crosstalk_coeff}"
+            )
 
         # Convenience aliases
         self.temperature: float = self._config.temperature
@@ -249,6 +265,7 @@ class Simulator:
         self.coupling_loss: float = self._config.coupling_loss
         self.loss_model: str = self._config.loss_model
         self.cascaded_loss: bool = self._config.cascaded_loss
+        self.thermal_crosstalk_coeff: float = self._config.thermal_crosstalk_coeff
 
     # ------------------------------------------------------------------
     # Loss computation helpers
@@ -292,6 +309,7 @@ class Simulator:
         auto_gain: Optional[bool] = None,
         normalize: Optional[bool] = None,
         cascaded_loss: Optional[bool] = None,
+        thermal_crosstalk_coeff: Optional[float] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace] | Dict[str, Any]:
         """Run a forward simulation.
 
@@ -354,7 +372,8 @@ class Simulator:
 
         # For deterministic mode, effectively disable noise by using a noise-free config
         effective_config = self._config
-        if exec_mode == ExecutionMode.DETERMINISTIC:
+        is_deterministic = exec_mode == ExecutionMode.DETERMINISTIC
+        if is_deterministic:
             effective_config = SimulatorConfig(
                 layer_loss_db=0.0,
                 coupling_loss=0.0,
@@ -367,7 +386,7 @@ class Simulator:
                 component_loss_db=self._config.component_loss_db,
                 mzm_loss=self._config.mzm_loss,
                 phase_shifter_loss=self._config.phase_shifter_loss,
-                # Explicitly disable TIA/ADC non-idealities
+                # Explicitly disable TIA/ADC/thermal non-idealities
                 tia_gain_error=1.0,
                 tia_offset=0.0,
                 tia_noise_std=0.0,
@@ -377,6 +396,7 @@ class Simulator:
                 adc_offset=0.0,
                 adc_transition_noise_lsb=0.0,
                 adc_inl_coefficient=0.0,
+                thermal_crosstalk_coeff=0.0,
             )
 
         return self._run_internal(
@@ -391,6 +411,7 @@ class Simulator:
             auto_gain=auto_gain,
             normalize=normalize,
             cascaded_loss=cascaded_loss,
+            thermal_crosstalk_coeff=0.0 if is_deterministic else thermal_crosstalk_coeff,
         )
 
     def _compute_module_loss_db(
@@ -420,6 +441,7 @@ class Simulator:
         auto_gain: Optional[bool] = None,
         normalize: Optional[bool] = None,
         cascaded_loss: Optional[bool] = None,
+        thermal_crosstalk_coeff: Optional[float] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, SimulationTrace]:
         """Internal single-run simulation with an optional config override."""
         # Validate mutual exclusivity
@@ -427,6 +449,15 @@ class Simulator:
             raise ValueError("Provide either 'seed' or 'generator', not both.")
 
         cfg = config_override if config_override is not None else self._config
+        eff_crosstalk = (
+            thermal_crosstalk_coeff
+            if thermal_crosstalk_coeff is not None
+            else cfg.thermal_crosstalk_coeff
+        )
+        if eff_crosstalk < 0.0 or eff_crosstalk >= 1.0:
+            raise ValueError(
+                f"thermal_crosstalk_coeff must be in [0.0, 1.0), got {eff_crosstalk}"
+            )
 
         # Resolve effective generator
         effective_gen: Optional[torch.Generator] = None
@@ -504,6 +535,9 @@ class Simulator:
                     injected_loss_db += layer_db
                 else:
                     core_mod._sim_loss_db_override = 0.0
+                if thermal_crosstalk_coeff is not None or eff_crosstalk > 0.0:
+                    if hasattr(core_mod, "_set_sim_crosstalk_override"):
+                        core_mod._set_sim_crosstalk_override(eff_crosstalk)
                 if return_trace:
                     core_mod._sim_trace_collector = layer_outputs_list
 
@@ -511,6 +545,8 @@ class Simulator:
         finally:
             for core_mod in core_layers:
                 core_mod._sim_loss_db_override = None
+                if hasattr(core_mod, "_set_sim_crosstalk_override"):
+                    core_mod._set_sim_crosstalk_override(None)
                 core_mod._sim_trace_collector = None
 
         # --- Resolve effective output domain ---
