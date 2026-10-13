@@ -1,3 +1,4 @@
+import math
 import warnings
 from typing import List, Optional
 
@@ -82,14 +83,9 @@ class PhaseShifter(OpticalComponent):
                 self.phase_noise_phi.zero_()
 
     def get_transfer_matrix(self) -> torch.Tensor:
-        # add phase noise
         apply_noise = not self.training or self.noise_aware_training
-        if apply_noise:
-            phi = self.phi + self.phase_noise_phi.to(self.phi.device, self.phi.dtype)
-        else:
-            phi = self.phi
-
-        return torch.exp(self._1j * phi.to(torch.complex64)).squeeze()
+        phi = self.phi + self.phase_noise_phi if apply_noise else self.phi
+        return torch.exp(1j * phi).squeeze()
 
 
 class Beamsplitter(OpticalComponent):
@@ -105,13 +101,18 @@ class Beamsplitter(OpticalComponent):
             raise ValueError("m and n must be non-negative integers")
         self.m = m
         self.n = n
+        scale = 2.0 ** -0.5
+        self.register_buffer(
+            "_transfer_matrix",
+            torch.tensor([[scale + 0j, 1j * scale], [1j * scale, scale + 0j]], dtype=torch.complex64),
+            persistent=False,
+        )
 
     def __repr__(self):
         return "<Beamsplitter, ports = {}>".format(self.ports)
 
     def get_transfer_matrix(self) -> torch.Tensor:
-        scale = 1.0 / torch.sqrt(torch.tensor(2.0, dtype=torch.float32, device=self._1j.device))
-        return scale * torch.tensor([[1+0j, 0+1j], [0+1j, 1+0j]], dtype=torch.complex64, device=self._1j.device)
+        return self._transfer_matrix
 
 
 class MZI(OpticalComponent):
@@ -210,23 +211,20 @@ class MZI(OpticalComponent):
                 self.phase_noise_phi.zero_()
 
     def get_transfer_matrix(self) -> torch.Tensor:
-        # Add phase noise
         apply_noise = not self.training or self.noise_aware_training
         if apply_noise:
-            phi = self.phi + self.phase_noise_phi.to(self.phi.device, self.phi.dtype)
-            theta = self.theta + self.phase_noise_theta.to(
-                self.theta.device, self.theta.dtype
-            )
+            phi = self.phi + self.phase_noise_phi
+            theta = self.theta + self.phase_noise_theta
         else:
             phi = self.phi
             theta = self.theta
 
-        exp_jphi = torch.exp(self._1j * phi)
-        exp_jtheta = torch.exp(self._1j * theta)
+        exp_jphi = torch.exp(1j * phi)
+        exp_jtheta = torch.exp(1j * theta)
 
         t00 = 0.5 * exp_jphi * (exp_jtheta - 1.0)
-        t01 = 0.5 * self._1j * exp_jphi * (1.0 + exp_jtheta)
-        t10 = 0.5 * self._1j * (exp_jtheta + 1.0)
+        t01 = 0.5j * exp_jphi * (1.0 + exp_jtheta)
+        t10 = 0.5j * (exp_jtheta + 1.0)
         t11 = 0.5 * (1.0 - exp_jtheta)
 
         row0 = torch.stack([t00.squeeze(), t01.squeeze()])
@@ -242,12 +240,17 @@ class WaveGuide(OpticalComponent):
         if not isinstance(m, int) or m < 0:
             raise ValueError("m must be a non-negative integer")
         self.m = m  # input waveguide A index (0-indexed)
+        self.register_buffer(
+            "_transfer_matrix",
+            torch.tensor(1 + 0j, dtype=torch.complex64),
+            persistent=False,
+        )
 
     def __repr__(self):
         return "<Waveguide ports = {}>".format(self.ports)
 
     def get_transfer_matrix(self) -> torch.Tensor:
-        return torch.tensor(1 + 0j, dtype=torch.complex64, device=self._1j.device)
+        return self._transfer_matrix
 
 
 class MZM(OpticalComponent):
@@ -314,14 +317,8 @@ class MZM(OpticalComponent):
 
     def get_transfer_matrix(self) -> torch.Tensor:
         apply_noise = not self.training or self.noise_aware_training
-        if apply_noise:
-            theta = self.theta + self.phase_noise_theta.to(
-                self.theta.device, self.theta.dtype
-            )
-        else:
-            theta = self.theta
-
-        return (0.5 * (torch.exp(self._1j * theta) + 1.0)).squeeze()
+        theta = self.theta + self.phase_noise_theta if apply_noise else self.theta
+        return (0.5 * (torch.exp(1j * theta) + 1.0)).squeeze()
 
 
 class Laser(OpticalComponent):
@@ -354,32 +351,28 @@ class Laser(OpticalComponent):
     ):
         if self.linewidth <= 0.0:
             return torch.zeros_like(power.real)
-        phase_variance = 2 * torch.pi * self.linewidth * dt
-        phase_std = torch.sqrt(
-            torch.tensor(phase_variance, dtype=power.dtype, device=power.device)
-        )
+        phase_std = math.sqrt(2 * math.pi * self.linewidth * dt)
         noise = torch.randn(power.real.shape, dtype=power.real.dtype, device=power.device, generator=generator)
-        phase_noise = noise * phase_std
-
-        return phase_noise
+        return noise * phase_std
 
     def simulate(self, E, generator: Optional[torch.Generator] = None):
         if not torch.is_tensor(E):
             raise TypeError("E must be a torch.Tensor")
         input_power_raw = torch.abs(E) ** 2
         noisy_power = input_power_raw + self.RIN_noise(input_power_raw, generator=generator)
-        min_pwr = torch.min(noisy_power).item()
-        if min_pwr < -1e-6:
-            neg_mask = noisy_power < 0
-            neg_ratio = neg_mask.float().mean().item()
-            warnings.warn(
-                f"Laser RIN noise produced negative optical power (min: {min_pwr:.3e}, "
-                f"affected: {neg_ratio*100:.1f}%). Negative values are clamped to 0 to prevent NaN, "
-                "which indicates the small-signal Gaussian RIN approximation has broken down "
-                "at low optical power or excessive noise levels.",
-                category=UserWarning,
-                stacklevel=2,
-            )
+        if not torch.compiler.is_compiling():
+            min_pwr = torch.amin(noisy_power).item()
+            if min_pwr < -1e-6:
+                neg_mask = noisy_power < 0
+                neg_ratio = neg_mask.float().mean().item()
+                warnings.warn(
+                    f"Laser RIN noise produced negative optical power (min: {min_pwr:.3e}, "
+                    f"affected: {neg_ratio*100:.1f}%). Negative values are clamped to 0 to prevent NaN, "
+                    "which indicates the small-signal Gaussian RIN approximation has broken down "
+                    "at low optical power or excessive noise levels.",
+                    category=UserWarning,
+                    stacklevel=2,
+                )
         input_power = torch.clamp(noisy_power, min=0.0)
 
         amplitude = torch.sqrt(input_power)
@@ -388,12 +381,12 @@ class Laser(OpticalComponent):
         else:
             original_phase = torch.where(
                 E < 0,
-                torch.tensor(torch.pi, device=E.device, dtype=E.dtype),
+                torch.full_like(E, torch.pi),
                 torch.zeros_like(E),
             )
         phase_jitter = self.phase_noise(input_power, generator=generator)
         total_phase = original_phase + phase_jitter
-        optical_field = amplitude * torch.exp(self._1j * total_phase)
+        optical_field = amplitude * torch.exp(1j * total_phase)
 
         return optical_field
 
@@ -451,12 +444,13 @@ class Detector(OpticalComponent):
 
     def simulate(self, power, q, k_b, temperature, generator: Optional[torch.Generator] = None):
         if not torch.is_complex(power):
-            min_power = torch.min(power).item()
-            if min_power < -1e-6:
-                raise ValueError(
-                    f"Optical power must be non-negative, but got minimum value {min_power:.3e}. "
-                    "Optical power cannot be negative in physical detection."
-                )
+            if not torch.compiler.is_compiling():
+                min_power = torch.amin(power).item()
+                if min_power < -1e-6:
+                    raise ValueError(
+                        f"Optical power must be non-negative, but got minimum value {min_power:.3e}. "
+                        "Optical power cannot be negative in physical detection."
+                    )
             safe_power = torch.clamp(power, min=0.0)
         else:
             safe_power = torch.abs(power)

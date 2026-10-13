@@ -437,4 +437,3 @@ def test_clements_mesh_and_fcarray_torch_compile_compatibility() -> None:
 
     torch.testing.assert_close(out_comp, out_eager, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(x_comp.grad, x.grad, atol=1e-5, rtol=1e-5)
-\n

@@ -8,7 +8,7 @@ import torch
 from torch.distributions import Bernoulli
 from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
-from .simulator import Simulator as get_simulator
+from .simulator import Simulator
 
 class Differentiator(metaclass=abc.ABCMeta):
     """
@@ -151,7 +151,7 @@ class PhysicalBernoulliDifferentiator(Differentiator):
     def __init__(self, simulator=None, step_size=0.05, eta=0.02):
         """
         Args:
-            simulator: ioptics.simulator.simulator 实例
+            simulator: ioptics.simulator.Simulator 实例
             step_size: 参数扰动的步长
             eta: 梯度缩放系数
         """
@@ -160,7 +160,7 @@ class PhysicalBernoulliDifferentiator(Differentiator):
         if not (isinstance(eta, (int, float)) and eta > 0 and torch.isfinite(torch.tensor(eta))):
             raise ValueError("eta must be a finite positive number")
 
-        self.simulator = simulator if simulator is not None else get_simulator()
+        self.simulator = simulator if simulator is not None else Simulator()
         self.step_size = step_size
         self.eta = eta
 

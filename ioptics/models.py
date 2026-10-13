@@ -250,35 +250,3 @@ class OpticalNN(torch.nn.Sequential):
             reset_history=reset_history,
         )
         return self._snapshot_history()
-
-    def fit_simulation(
-        self,
-        loss_function: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-        X_input: torch.Tensor,
-        y_label: torch.Tensor,
-        epochs: int,
-        differentiator: Differentiator,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        lr: float = 0.01,
-        batch_size: int = 32,
-        verbose: bool = True,
-        metric_fn: Optional[Callable[[torch.Tensor, torch.Tensor], float | torch.Tensor]] = None,
-        reset_history: bool = False,
-    ) -> TrainingHistory:
-        """Deprecated: use fit(..., simulator=...) instead."""
-        if not hasattr(differentiator, 'simulator') or differentiator.simulator is None:
-            raise TypeError("differentiator 必须有 simulator 属性，请使用 PhysicalBernoulliDifferentiator")
-        return self.fit(
-            loss_function=loss_function,
-            X_input=X_input,
-            y_label=y_label,
-            epochs=epochs,
-            differentiator=differentiator,
-            simulator=differentiator.simulator,
-            optimizer=optimizer,
-            lr=lr,
-            batch_size=batch_size,
-            verbose=verbose,
-            metric_fn=metric_fn,
-            reset_history=reset_history,
-        )

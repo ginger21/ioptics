@@ -11,18 +11,6 @@ class _ZeroGradientDifferentiator:
         return torch.zeros(num_params, device=inputs.device)
 
 
-class _NoSimulatorDifferentiator:
-    def differentiate(self, model, inputs, loss_fn, y_label=None, **kwargs):
-        raise NotImplementedError
-
-
-class _NoneSimulatorDifferentiator:
-    simulator = None
-
-    def differentiate(self, model, inputs, loss_fn, y_label=None, **kwargs):
-        raise NotImplementedError
-
-
 def test_calculate_accuracy_batch_size_mismatch():
     """Test calculate_accuracy raises ValueError when X_input batch size doesn't match y_label length."""
     layer = ClementsMesh(L=4)
@@ -357,30 +345,6 @@ def test_fit_metric_fn_returns_string_raises_type_error():
             epochs=1,
             differentiator=differentiator,
             metric_fn=string_metric,
-            verbose=False,
-            batch_size=4,
-        )
-
-
-@pytest.mark.parametrize(
-    "differentiator",
-    [_NoSimulatorDifferentiator(), _NoneSimulatorDifferentiator()],
-)
-def test_fit_simulation_raises_when_differentiator_has_no_usable_simulator(differentiator):
-    layer = ClementsMesh(L=4)
-    model = OpticalNN(layer)
-    loss_function = torch.nn.CrossEntropyLoss()
-
-    X = torch.randn(8, 4) + 1j * torch.randn(8, 4)
-    y = torch.randint(0, 4, (8,))
-
-    with pytest.raises(TypeError, match="differentiator 必须有 simulator 属性，请使用 PhysicalBernoulliDifferentiator"):
-        model.fit_simulation(
-            loss_function=loss_function,
-            X_input=X,
-            y_label=y,
-            epochs=1,
-            differentiator=differentiator,
             verbose=False,
             batch_size=4,
         )

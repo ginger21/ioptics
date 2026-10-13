@@ -45,46 +45,61 @@ class MeshColumn(ColumnLayer):
             n_list = [c.n for c in self.components]
             self.register_buffer("_mzi_m_idx", torch.tensor(m_list, dtype=torch.long), persistent=False)
             self.register_buffer("_mzi_n_idx", torch.tensor(n_list, dtype=torch.long), persistent=False)
+            m_t = self._mzi_m_idx
+            n_t = self._mzi_n_idx
+            scatter_idx = torch.cat([m_t * N + m_t, m_t * N + n_t, n_t * N + m_t, n_t * N + n_t])
+            self.register_buffer("_mzi_scatter_idx", scatter_idx, persistent=False)
+            base_eye = torch.eye(N, dtype=torch.complex64)
+            for p in set(m_list + n_list):
+                base_eye[p, p] = 0.0
+            self.register_buffer("_base_eye_flat", base_eye.reshape(-1), persistent=False)
         else:
             self._mzi_m_idx = None
             self._mzi_n_idx = None
+            self._mzi_scatter_idx = None
+            self._base_eye_flat = None
 
     def get_transfer_matrix(self) -> torch.Tensor:
         if len(self.components) == 0:
             return torch.eye(self.N, dtype=torch.complex64)
 
         if self._all_mzi:
-            thetas = []
-            phis = []
-            for c in self.components:
-                c_apply_noise = not self.training or c.noise_aware_training
-                if c_apply_noise:
-                    thetas.append(c.theta + c.phase_noise_theta.to(c.theta.device, c.theta.dtype))
-                    phis.append(c.phi + c.phase_noise_phi.to(c.phi.device, c.phi.dtype))
-                else:
-                    thetas.append(c.theta)
-                    phis.append(c.phi)
+            thetas = [
+                (c.theta + c.phase_noise_theta).view(1)
+                if (not self.training or c.noise_aware_training)
+                else c.theta.view(1)
+                for c in self.components
+            ]
+            phis = [
+                (c.phi + c.phase_noise_phi).view(1)
+                if (not self.training or c.noise_aware_training)
+                else c.phi.view(1)
+                for c in self.components
+            ]
 
-            thetas = torch.cat([t.view(1) for t in thetas])
-            phis = torch.cat([p.view(1) for p in phis])
-            _1j = self.components[0]._1j
+            theta_vec = torch.cat(thetas)
+            phi_vec = torch.cat(phis)
 
-            exp_jphi = torch.exp(_1j * phis)
-            exp_jtheta = torch.exp(_1j * thetas)
+            exp_jphi = torch.exp(1j * phi_vec)
+            exp_jtheta = torch.exp(1j * theta_vec)
 
             t00 = 0.5 * exp_jphi * (exp_jtheta - 1.0)
-            t01 = 0.5 * _1j * exp_jphi * (1.0 + exp_jtheta)
-            t10 = 0.5 * _1j * (exp_jtheta + 1.0)
+            t01 = 0.5j * exp_jphi * (1.0 + exp_jtheta)
+            t10 = 0.5j * (exp_jtheta + 1.0)
             t11 = 0.5 * (1.0 - exp_jtheta)
 
-            T = torch.eye(self.N, dtype=t00.dtype, device=t00.device)
-            m = self._mzi_m_idx.to(device=T.device)
-            n = self._mzi_n_idx.to(device=T.device)
-            T[m, m] = t00
-            T[m, n] = t01
-            T[n, m] = t10
-            T[n, n] = t11
-            return T
+            vals = torch.cat([t00, t01, t10, t11])
+            base_flat = (
+                self._base_eye_flat
+                if (self._base_eye_flat.dtype == vals.dtype and self._base_eye_flat.device == vals.device)
+                else self._base_eye_flat.to(device=vals.device, dtype=vals.dtype)
+            )
+            scatter_idx = (
+                self._mzi_scatter_idx
+                if self._mzi_scatter_idx.device == vals.device
+                else self._mzi_scatter_idx.to(device=vals.device)
+            )
+            return base_flat.scatter(0, scatter_idx, vals).view(self.N, self.N)
 
         # General fallback for mixed or custom components
         first_T = self.components[0].get_transfer_matrix()
@@ -138,35 +153,31 @@ class ArrayColumn(ColumnLayer):
 
         if self._all_mzm:
             thetas = [
-                (c.theta + c.phase_noise_theta.to(c.theta.device, c.theta.dtype)).view(1)
+                (c.theta + c.phase_noise_theta).view(1)
                 if (not self.training or c.noise_aware_training)
                 else c.theta.view(1)
                 for c in self.components
             ]
             theta_vec = torch.cat(thetas)
-            _1j = self.components[0]._1j
-            vals = 0.5 * (torch.exp(_1j * theta_vec) + 1.0)
+            vals = 0.5 * (torch.exp(1j * theta_vec) + 1.0)
             if self._is_contiguous_full:
                 return vals
-            T = torch.zeros(self.N, dtype=vals.dtype, device=vals.device)
-            T[self._comp_m_idx.to(device=T.device)] = vals
-            return T
+            idx = self._comp_m_idx if self._comp_m_idx.device == vals.device else self._comp_m_idx.to(device=vals.device)
+            return torch.zeros(self.N, dtype=vals.dtype, device=vals.device).scatter(0, idx, vals)
 
         if self._all_ps:
             phis = [
-                (c.phi + c.phase_noise_phi.to(c.phi.device, c.phi.dtype)).view(1)
+                (c.phi + c.phase_noise_phi).view(1)
                 if (not self.training or c.noise_aware_training)
                 else c.phi.view(1)
                 for c in self.components
             ]
             phi_vec = torch.cat(phis)
-            _1j = self.components[0]._1j
-            vals = torch.exp(_1j * phi_vec)
+            vals = torch.exp(1j * phi_vec)
             if self._is_contiguous_full:
                 return vals
-            T = torch.zeros(self.N, dtype=vals.dtype, device=vals.device)
-            T[self._comp_m_idx.to(device=T.device)] = vals
-            return T
+            idx = self._comp_m_idx if self._comp_m_idx.device == vals.device else self._comp_m_idx.to(device=vals.device)
+            return torch.zeros(self.N, dtype=vals.dtype, device=vals.device).scatter(0, idx, vals)
 
         first_T = self.components[0].get_transfer_matrix()
         transfer_matrix = torch.zeros(
@@ -175,20 +186,14 @@ class ArrayColumn(ColumnLayer):
             device=first_T.device,
         )
 
-        #transfer_matrix_list = []
-        #componets_list = sorted(self.components, key=lambda component:component.m)
         for inx, component in enumerate(self.components):
-            # component = cast(OpticalComponent, component)
             T = first_T if inx == 0 else component.get_transfer_matrix()
             T = T.to(device=transfer_matrix.device, dtype=transfer_matrix.dtype)
             if component.dof == 1:
                 m = component.m
-                # m = cast(int, m)
                 transfer_matrix[m] = T
-                # transfer_matrix_list.append(T)
             elif component.dof == 2:
                 raise ValueError(f"The dof must be 1, now it is {component.dof}!")
-            # transfer_matrix = torch.stack(transfer_matrix_list)
         return transfer_matrix
 
 
@@ -266,7 +271,9 @@ class CoreLayer(torch.nn.Module):
             else:
                 input_tensor = input_tensor.to(torch.complex64)
 
-        transfer_matrix = self.get_transfer_matrix().to(device=input_tensor.device, dtype=input_tensor.dtype)
+        transfer_matrix = self.get_transfer_matrix()
+        if transfer_matrix.device != input_tensor.device or transfer_matrix.dtype != input_tensor.dtype:
+            transfer_matrix = transfer_matrix.to(device=input_tensor.device, dtype=input_tensor.dtype)
 
         if transfer_matrix.ndim != 2:
             raise ValueError(
@@ -312,7 +319,9 @@ class MeshCore(CoreLayer):
     def _field_prop_forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
         current_field = input_tensor
         for layer in self.columnlayers:
-            T_col = layer.get_transfer_matrix().to(device=current_field.device, dtype=current_field.dtype)
+            T_col = layer.get_transfer_matrix()
+            if T_col.device != current_field.device or T_col.dtype != current_field.dtype:
+                T_col = T_col.to(device=current_field.device, dtype=current_field.dtype)
             current_field = F.linear(current_field, T_col)
         return current_field[..., self.output_ports]
 
@@ -400,15 +409,14 @@ class ArrayCore(CoreLayer):
             for col in self.columnlayers
         ):
             thetas = [
-                (c.theta + c.phase_noise_theta.to(c.theta.device, c.theta.dtype)).view(1)
+                (c.theta + c.phase_noise_theta).view(1)
                 if (not col.training or c.noise_aware_training)
                 else c.theta.view(1)
                 for col in self.columnlayers
                 for c in col.components
             ]
             theta_mat = torch.cat(thetas).view(self.L, self.columnlayers[0].N)
-            _1j = self.columnlayers[0].components[0]._1j
-            return 0.5 * (torch.exp(_1j * theta_mat) + 1.0)
+            return 0.5 * (torch.exp(1j * theta_mat) + 1.0)
 
         first_T = self.columnlayers[0].get_transfer_matrix()
         rows = [first_T]

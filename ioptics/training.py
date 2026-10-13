@@ -80,13 +80,15 @@ class OpticalTrainer:
             num_samples = X_input.shape[0]
 
             for e in range(epochs):
-                epoch_loss = 0.0
-                epoch_correct = 0
+                epoch_loss_t = torch.zeros((), dtype=torch.float64, device=device)
+                epoch_correct_t = torch.zeros((), dtype=torch.long, device=device)
                 epoch_metric = 0.0
 
                 for batch_X, batch_y in dataloader:
-                    batch_X = batch_X.to(device)
-                    batch_y = batch_y.to(device)
+                    if batch_X.device != device:
+                        batch_X = batch_X.to(device)
+                    if batch_y.device != device:
+                        batch_y = batch_y.to(device)
 
                     gradients = differentiator.differentiate(
                         model, batch_X, loss_function, y_label=batch_y
@@ -95,22 +97,23 @@ class OpticalTrainer:
 
                     with torch.no_grad():
                         outputs = output_getter(batch_X)
-                        current_loss, correct = model._compute_batch_stats(outputs, batch_y, loss_function)
+                        outputs = model._ensure_batch_dimension(outputs)
+                        current_loss = loss_function(outputs, batch_y)
+                        batch_len = batch_X.size(0)
+                        epoch_loss_t = epoch_loss_t + current_loss.detach() * batch_len
 
                         if metric_fn is not None:
                             metric_value = model._coerce_metric_scalar(metric_fn(outputs, batch_y))
-                            epoch_metric += metric_value * batch_X.size(0)
+                            epoch_metric += metric_value * batch_len
                         else:
-                            epoch_correct += correct
+                            epoch_correct_t = epoch_correct_t + (outputs.argmax(dim=-1) == batch_y).sum()
 
-                    epoch_loss += current_loss.item() * batch_X.size(0)
-
-                avg_loss = epoch_loss / num_samples
+                avg_loss = epoch_loss_t.item() / num_samples
                 if metric_fn is not None:
                     avg_metric = epoch_metric / num_samples
                     model.accuracy_history.append(avg_metric)
                 else:
-                    avg_accuracy = 100 * epoch_correct / num_samples
+                    avg_accuracy = 100.0 * epoch_correct_t.item() / num_samples
                     model.accuracy_history.append(avg_accuracy)
 
                 model.loss_history.append(avg_loss)

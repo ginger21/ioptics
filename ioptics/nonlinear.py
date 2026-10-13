@@ -37,7 +37,7 @@ class SPMActivation(torch.nn.Module):
         self.register_buffer("gain", torch.tensor(gain, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gain = self.gain.to(device=x.device, dtype=x.real.dtype)
+        gain = self.gain if (self.gain.device == x.device and self.gain.dtype == x.real.dtype) else self.gain.to(device=x.device, dtype=x.real.dtype)
         return x * torch.exp(-1j * gain * torch.abs(x)**2)
 
 
@@ -82,9 +82,10 @@ class ElectroOpticActivation(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.real.dtype
         device = x.device
-        alpha = self.alpha.to(device=device, dtype=dtype)
-        g = self.g.to(device=device, dtype=dtype)
-        phi_b = self.phi_b.to(device=device, dtype=dtype)
+        need_cast = self.alpha.device != device or self.alpha.dtype != dtype
+        alpha = self.alpha.to(device=device, dtype=dtype) if need_cast else self.alpha
+        g = self.g.to(device=device, dtype=dtype) if need_cast else self.g
+        phi_b = self.phi_b.to(device=device, dtype=dtype) if need_cast else self.phi_b
 
         abs_sq = torch.abs(x)**2
         arg = 0.5 * (g * abs_sq + phi_b)
@@ -122,32 +123,25 @@ class SigmoidLikeActivation(torch.nn.Module):
         self.register_buffer("noise_mean", torch.tensor(noise_mean, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Power domain processing: P = |x|^2
         p = torch.abs(x)**2
 
         dtype = p.dtype
         device = p.device
+        need_cast = self.midpoint.device != device or self.midpoint.dtype != dtype
 
-        midpoint = self.midpoint.to(device=device, dtype=dtype)
-        steepness = self.steepness.to(device=device, dtype=dtype)
+        midpoint = self.midpoint.to(device=device, dtype=dtype) if need_cast else self.midpoint
+        steepness = self.steepness.to(device=device, dtype=dtype) if need_cast else self.steepness
 
-        # Base sigmoid response in power domain
         p_act = torch.sigmoid(steepness * (p - midpoint))
 
-        # Additive Gaussian noise in power domain
-        noise_std = self.noise_std.to(device=device, dtype=dtype)
-        noise_mean = self.noise_mean.to(device=device, dtype=dtype)
+        noise_std = self.noise_std.to(device=device, dtype=dtype) if need_cast else self.noise_std
+        noise_mean = self.noise_mean.to(device=device, dtype=dtype) if need_cast else self.noise_mean
 
-        if noise_std > 0:
+        if self.noise_std > 0:
             p_act = p_act + torch.randn_like(p_act) * noise_std + noise_mean
 
-        # Clamp noisy power to be non-negative
         p_noisy = torch.clamp(p_act, min=0.0)
-
-        # Scale amplitude to get output field: E_out = x * sqrt(P_noisy / (P + eps))
-        # Use a small epsilon to avoid division by zero
-        eps = torch.tensor(1e-12, device=device, dtype=dtype)
-        scale = torch.sqrt(p_noisy / (p + eps))
+        scale = torch.sqrt(p_noisy / (p + 1e-12))
 
         return x * scale
 
@@ -173,11 +167,10 @@ class TanhLikeActivation(torch.nn.Module):
         dtype = p.dtype
         device = p.device
 
-        gain = self.gain.to(device=device, dtype=dtype)
+        gain = self.gain if (self.gain.device == device and self.gain.dtype == dtype) else self.gain.to(device=device, dtype=dtype)
         p_out = torch.tanh(gain * p)
 
-        eps = torch.tensor(1e-12, device=device, dtype=dtype)
-        scale = torch.sqrt(p_out / (p + eps))
+        scale = torch.sqrt(p_out / (p + 1e-12))
         return x * scale
 
 

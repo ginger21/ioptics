@@ -481,11 +481,12 @@ class Simulator:
         elif domain == InputDomain.POWER:
             # Power -> field: E = sqrt(P)  (phase assumed zero)
             pwr = input_feature.real if torch.is_complex(input_feature) else input_feature
-            min_pwr = torch.min(pwr).item()
-            if min_pwr < -1e-6:
-                raise ValueError(
-                    f"Input optical power must be non-negative, but got minimum value {min_pwr:.3e}."
-                )
+            if not torch.compiler.is_compiling():
+                min_pwr = torch.amin(pwr).item()
+                if min_pwr < -1e-6:
+                    raise ValueError(
+                        f"Input optical power must be non-negative, but got minimum value {min_pwr:.3e}."
+                    )
             pwr = torch.clamp(pwr, min=0.0)
             E_field = torch.sqrt(pwr.to(torch.float32))
         else:
@@ -546,12 +547,13 @@ class Simulator:
                 # Safeguard: if user forced POWER mode on complex output, convert to intensity
                 detected_optical_power = torch.abs(model_output_after_loss) ** 2
             else:
-                min_pwr = torch.min(model_output_after_loss).item()
-                if min_pwr < -1e-6:
-                    raise ValueError(
-                        f"Model output optical power must be non-negative, but got minimum value {min_pwr:.3e}. "
-                        "Check model architecture or output domain configuration."
-                    )
+                if not torch.compiler.is_compiling():
+                    min_pwr = torch.amin(model_output_after_loss).item()
+                    if min_pwr < -1e-6:
+                        raise ValueError(
+                            f"Model output optical power must be non-negative, but got minimum value {min_pwr:.3e}. "
+                            "Check model architecture or output domain configuration."
+                        )
                 detected_optical_power = torch.clamp(model_output_after_loss, min=0.0)
 
         # --- Detector ---
@@ -572,18 +574,20 @@ class Simulator:
         # --- TIA ---
         eff_auto_gain = auto_gain if auto_gain is not None else cfg.auto_gain
         if eff_auto_gain:
-            # Auto-gain: dynamically scale transimpedance so maximum signal reaches ~85% of ADC range
-            max_current = torch.max(photocurrent).item()
-            if max_current > 1e-9:
-                target_voltage = 0.85 * cfg.adc_v_range
-                eff_transimpedance = min(target_voltage / max_current, 1e7)
-            else:
-                eff_transimpedance = cfg.tia_transimpedance
+            # Auto-gain: dynamically scale transimpedance on-device without CPU-GPU .item() sync
+            max_current = torch.amax(photocurrent)
+            target_voltage = 0.85 * cfg.adc_v_range
+            dynamic_gain = torch.clamp(target_voltage / torch.clamp(max_current, min=1e-9), max=1e7)
+            eff_transimpedance = torch.where(
+                max_current > 1e-9,
+                dynamic_gain,
+                torch.tensor(cfg.tia_transimpedance, dtype=photocurrent.dtype, device=photocurrent.device),
+            )
+            voltage = photocurrent * eff_transimpedance
         else:
             eff_transimpedance = cfg.tia_transimpedance
-
-        tia = TIA(transimpedance=eff_transimpedance)
-        voltage = tia.simulate(photocurrent)
+            tia = TIA(transimpedance=eff_transimpedance)
+            voltage = tia.simulate(photocurrent)
 
         # Apply TIA non-idealities (P2)
         voltage = _apply_tia_non_idealities(
