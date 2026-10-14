@@ -71,8 +71,12 @@
 - **规范张量生命周期与清理遗留接口** [已完成]：移除已弃用的 `OpticalNN.fit_simulation`；统一 `device` 与 `dtype` 处理，消除内层循环中冗余的 `.to()` 调用。
 
 ### 阶段五：未来极致加速与前沿硬件特性 (P3/Future)
-- **拓扑级稀疏波导原位传递** [待完成]：单列仅原位更新 $N/2$ 对有效 MZI 波导端口，整网前向复杂度从 $O(N^3)$ 降至 $O(N^2)$，理论 FLOPs 再降 10x ~ 30x。
+- **拓扑级稀疏波导原位传递** [已评估暂不实施]：经详细性能分析，纯 Python/PyTorch 切片拼接会产生大量小算子调度开销（Kernel Launch Overhead），吞噬理论 FLOPs 优势（仅 1.2x 加速且显著增加代码维护复杂度），静态推理亦远慢于现有的整层缓存（0.03ms）；未来若实施需直接下沉为单一 C++/CUDA/Triton Fused Kernel，纯框架层不再做碎片化切片重构。
 - **参数位移法批处理并行化** [已完成]：在 `ParameterShiftStrategy`、`MeshCore`/`ArrayCore.forward_parameter_shifts` 与 `ParameterShiftDifferentiator` 中将全部参数的 $\pm\pi/2$ 扰动状态在参数批维度一次性向量化并行展开，消除逐参数串行循环；$N=8$ 耗时从 `403.2ms` 降至 **`7.56ms`**（提速 **53.3x**），$N=16$ 降至 **`22.07ms`**（提速 **59.3x**），$N=64$（4032 参数）仅需 **`394.05ms`**。
 - **消除 CPU-GPU 同步屏障** [已完成]：移除 Auto-Gain 与训练批循环热路径中的 `.item()` 调用，改为纯张量运算保持显存流水线。
 - **消除 Inplace 写入并适配 `torch.compile`** [已完成]：将转移矩阵构建中的切片原地写入改为函数式 `scatter` 算子，支持 Dynamo 图捕获与算子融合。
 - **热串扰矩阵（Thermal Crosstalk Matrix）** [已完成]：在 `ColumnLayer`、`MeshColumn`、`ArrayColumn` 与 `Simulator` 中引入列内相邻相移器间的空间热扩散耦合矩阵 $C \cdot \boldsymbol{\theta}$（支持指数衰减与自定义实测矩阵），并在 `AdjointVariant`、`ParameterShift` 与 `Autograd` 中实现严格的梯度闭环。
+- **硬件在环鲁棒原位训练（Noise-Aware In-Situ Training）** [待完成]：在硬件噪声与测量量化失真下，设计抗噪梯度估计与优化策略（滤波、动量信噪比自适应步长、平坦极小值噪声感知训练与原位自校准算法）。
+- **多元光子网络拓扑扩展与大规模分块仿真（Multi-Topology & Scalability）** [待完成]：扩展支持 Reck 三角形网格、Diamond、Butterfly/Benes 网格拓扑及超大尺度（$N \ge 128, 256$）块对角化多芯片拼接光电混合建模。
+- **编译期深度优化与 CUDA Graph 固化（CUDA Graph & Deep Compilation）** [待完成]：梳理控制流适配 `torch.compile(mode="reduce-overhead")`，并在 GPU 环境下通过 CUDA Graph 固化固定拓扑与批大小的光场流，彻底消除内核发射开销。
+- **高保真微观光学非线性效应建模（High-Fidelity Nonlinear Photonics）** [待完成]：在 `nonlinear.py` 中引入双光子吸收（TPA）、自由载流子吸收（FCA）及高阶色散效应的可微物理速率方程。

@@ -270,9 +270,13 @@
   - 统一输入与内部张量的 `device` 和 `dtype` 处理，利用原生复数标量乘法与预注册组件 buffer 消除内层循环中冗余的 `.to()` 调用。
 
 ### 阶段五：未来极致加速与前沿硬件特性（Future 展望 / 待后续迭代）
-- [ ] **拓扑级稀疏波导原位传递（Sparse Waveguide In-place Propagation）**：
-  - **背景**：当前逐列场传递中每列仍构建 $N\times N$ 矩阵并执行全矩阵乘法（$O(N^2)$）。
-  - **方案**：物理上每列仅有 $N/2$ 个 MZI 作用于端口 $(m_k, n_k)$，其余直通波导保持原值。通过原位仅更新 $x[..., m]$ 与 $x[..., n]$ 局部端口，单列 FLOPs 从 $O(N^2)$ 降至 $O(N)$，整网前向总复杂度从 $O(N^3)$ 降至 $O(N^2)$，运算量理论再降 10x ~ 30x。
+- [~] **拓扑级稀疏波导原位传递（Sparse Waveguide In-place Propagation）[技术评估：纯 Python 层不实施 / 待未来定制 Fused Kernel]**：
+  - **理论背景**：物理上每列仅有 $N/2$ 个 MZI 作用于端口 $(m_k, n_k)$，其余直通波导保持原值。理论上若仅原位更新局部端口，单列 FLOPs 可从 $O(N^2)$ 降至 $O(N)$，整网理论计算量减少。
+  - **不实施原因与瓶颈评估 (Bottleneck Analysis)**：
+    1. **算子发射与显存访存开销吞噬理论收益（Kernel Launch & Memory Bound）**：在纯 Python/PyTorch 层面，每列进行张量切片更新（`view`, `slice`, `cat`, `scatter`）会引入 4~6 个独立的 PyTorch 微小算子。对于 $N=64$ 网格（64 列），前向单次需连续调度超过 300 次碎小算子与内存分配，调度延迟严重吞噬了算力减少带来的收益（实测动态训练前向仅加速约 1.2x，性价比极低）；
+    2. **底层硬件级 GEMM 高度优化**：原方案调用的 `F.linear` 底层由 Intel MKL/OpenBLAS（CPU）或 cuBLAS（GPU）的高性能连续矩阵指令完成，单次核函数调用效率远高于 Python 解释器内数百次切片算子；
+    3. **静态整层缓存已达到微秒级极限**：阶段四实现的静态转移矩阵缓存已使 `eval()` 推理耗时降至 0.03ms（加速 1500x+），任何逐列传播（密集或稀疏）均无法逾越该缓存速度。
+  - **未来有效实施路径**：未来若要发挥该稀疏特性的理论加速比，必须直接下沉为定制化的单一 C++/CUDA/Triton Fused Kernel（将全部列在 GPU 共享内存/SRAM 或 CPU 寄存器内原地完成干涉迭代，单次核函数发射），纯 PyTorch 层不再做碎片化切片重构。
 - [x] **参数位移法（Parameter Shift）批处理并行化 (Completed ✅)**：
   - **背景**：此前片上原位调谐 `ParameterShiftStrategy` 与 `ParameterShiftDifferentiator` 采用 Python `for` 逐参数串行扰动，对于 $N \ge 16$ 耗时极长。
   - **方案**：在 `ParameterShiftStrategy`、`MeshCore`/`ArrayCore.forward_parameter_shifts` 与 `ParameterShiftDifferentiator` 中，在参数批维度一次性向量化展开全部参数的 $\pm\pi/2$ 扰动状态，消除逐参数 Python 循环与全网转移矩阵重乘；`Bwd (ParamShift)` 在 $N=8$ 从 Baseline 的 `403.15ms` 骤降至 **`7.56ms`**（提速 **53.3x**），$N=16$ 从 `1309ms` 降至 **`22.07ms`**（提速 **59.3x**），$N=32$ 仅需 **`66.59ms`**，$N=64$（4032 参数）由原先不可行的数十秒缩短至 **`394.05ms`**。
@@ -282,6 +286,18 @@
   - 预计算 `MeshColumn` 稀疏散射索引 `_mzi_scatter_idx` 与基底单位阵 `_base_eye_flat`，将切片就地写入改为函数式非原地 `scatter` 算子，支持 `torch.compile` 图捕获与算子融合。
 - [x] **热串扰矩阵（Thermal Crosstalk Matrix）空间物理建模 (Completed ✅)**：
   - 在 `ColumnLayer`（`MeshColumn` / `ArrayColumn`）中支持基于空间波导端口距离衰减的近邻热串扰矩阵 $C_{ij} = \alpha^{|p_i - p_j|}$ 与自定义实测矩阵注入；在有效相位 $\boldsymbol{\theta}_{\text{eff}} = C \boldsymbol{\theta} + \boldsymbol{\delta\theta}_{\text{noise}}$ 上计算中间光场与局部干涉导数，并通过链式法则 $C^\top \nabla_{\boldsymbol{\theta}_{\text{eff}}} \mathcal{L}$ 实现与 PyTorch `Autograd` 机器精度对齐；在 `SimulatorConfig` 中将 `HardwareProfile.LAB`（1%）与 `HARDWARE_LIKE`（3%）配置热串扰，并在确定性模式下自动抑制。
+- [ ] **硬件在环鲁棒原位训练（Noise-Aware In-Situ Training）**：
+  - **背景**：在 `Simulator` 开启硬件噪声（散粒噪声、热噪声、激光抖动、ADC 量化失真与热串扰）时，直接片上量测求导（如参数位移法 $\frac{f(\theta+\pi/2)-f(\theta-\pi/2)}{2}$ 和随机伯努利扰动法）会显著放大测量噪声，导致梯度方差大、训练易震荡或发散。
+  - **方案**：引入抗噪梯度估计与优化策略（如多采样平滑滤波、动量信噪比自适应步长、梯度置信度加权）；在前向或反向中引入物理噪声感知训练（Noise-Aware Training）以搜索对相移误差不敏感的平坦极小值（Flat Minima），并探索片上原位自校准（In-situ Self-Calibration）算法。
+- [ ] **多元光子网络拓扑扩展与大规模分块仿真（Multi-Topology & Scalability）**：
+  - **背景**：目前框架主要支持 Clements 网格（正方形拓扑）和全连接阵列（FCArray），缺乏对其他经典和前沿光子架构的原生支持。
+  - **方案**：扩展支持 Reck 三角形网格、Diamond、Butterfly 及 Benes 网格等不同紧凑度与插入损耗特性的拓扑；针对超大规模矩阵（$N \ge 128, 256$），引入块对角化（Block-Diagonal）与多芯片拼接（Multi-Core）光电混合网络建模。
+- [ ] **编译期深度优化与 CUDA Graph 固化（CUDA Graph & Deep Compilation）**：
+  - **背景**：阶段五已通过函数式 scatter 消除 inplace 写入以适配 Dynamo 图捕获，但在 GPU 上小 Batch 场景下仍存在 Python 与 PyTorch 框架调度开销。
+  - **方案**：梳理静态前向光场流与伴随反向图的动态控制流，适配 `torch.compile(mode="reduce-overhead")`；在 GPU 环境下对固定拓扑与 Batch 的执行图进行 CUDA Graph 固化，完全消除 CPU-GPU 启动与小算子发射开销（Kernel Launch Overhead）。
+- [ ] **高保真微观光学非线性效应建模（High-Fidelity Nonlinear Photonics）**：
+  - **背景**：当前全光激活（SPMActivation）与电光激活（ElectroOpticActivation）模型为宏观理想代数模型，未考虑高光功率下的微观半导体载流子动态响应。
+  - **方案**：在 `nonlinear.py` 中引入双光子吸收（Two-Photon Absorption, TPA）、自由载流子吸收（Free Carrier Absorption, FCA）及高阶色散效应的可微物理速率方程，兼顾物理高保真度与数值反向传播效率。
 
 ---
 
